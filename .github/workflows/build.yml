@@ -1,0 +1,101 @@
+name: Build Windows EXEs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Python ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Install dependencies ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      # ── 4. Build token_generator.exe ─────────────────────────────────────────
+      - name: Build token_generator.exe
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "Balfund_Token_Generator" `
+            --icon NONE `
+            token_generator.py
+
+      # ── 5. Build ha_strategy_dhan.exe (console — terminal output visible) ────
+      - name: Build ha_strategy_dhan.exe
+        run: |
+          pyinstaller `
+            --onefile `
+            --console `
+            --name "Balfund_HA_Trader" `
+            --add-data "dhan_ws_client.py;." `
+            ha_strategy_dhan.py
+
+      # ── 6. List outputs ──────────────────────────────────────────────────────
+      - name: List dist folder
+        run: |
+          dir dist\
+
+      # ── 7. Upload both EXEs as GitHub Actions artifact ───────────────────────
+      - name: Upload EXEs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Balfund-HA-Trader-Windows
+          path: |
+            dist\Balfund_Token_Generator.exe
+            dist\Balfund_HA_Trader.exe
+          retention-days: 30
+
+      # ── 8. Create GitHub Release on every push to main ───────────────────────
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.sha.outputs.short }}
+          name: "Balfund HA Trader — build ${{ steps.sha.outputs.short }}"
+          body: |
+            ## Balfund HA + SMA(1) Strategy Trader
+
+            ### Files
+            | File | Description |
+            |------|-------------|
+            | `Balfund_Token_Generator.exe` | Run this first — generates Dhan token |
+            | `Balfund_HA_Trader.exe` | Main strategy — run after token is generated |
+
+            ### How to use
+            1. Run `Balfund_Token_Generator.exe` → enter credentials → click **Generate Token**
+            2. Run `Balfund_HA_Trader.exe` in a terminal / command prompt
+            3. Follow the prompts (timeframe, qty, sq-off times)
+
+            ### Requirements
+            - Windows 10/11
+            - Internet connection
+            - Dhan trading account with API access enabled
+
+            Built from commit `${{ github.sha }}`
+          files: |
+            dist/Balfund_Token_Generator.exe
+            dist/Balfund_HA_Trader.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

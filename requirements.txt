@@ -1,0 +1,5 @@
+customtkinter
+pyotp
+requests
+websocket-client
+python-dotenv

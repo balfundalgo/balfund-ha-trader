@@ -58,6 +58,7 @@ def red(s):    return s
 def yellow(s): return s
 def cyan(s):   return s
 def bold(s):   return s
+def grey(s):   return s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1375,6 +1376,45 @@ class HATradingApp(ctk.CTk):
         self.mcx_sq_var=ctk.StringVar(value="23:25")
         self.paper_var=ctk.BooleanVar(value=True)
         self._build_ui(); self.after(2000,self._gui_tick)
+        self.after(500, self._preload_instruments)  # load table on startup
+
+    def _preload_instruments(self):
+        """Resolve instruments in background on startup so table is pre-populated."""
+        self._append_log("[AUTO] Pre-loading instruments in background...")
+        threading.Thread(target=self._do_preload, daemon=True).start()
+
+    def _do_preload(self):
+        try:
+            c, t = fetch_token_from_generator()
+            self._client_id = c; self._access_token = t
+            rows = load_master_csv()
+            nse_ids = resolve_nse_stocks(rows, NSE_STOCKS)
+            instruments = []
+            nq = self.nse_qty_var.get()
+            for sym in NSE_STOCKS:
+                sid = nse_ids.get(sym)
+                if not sid: continue
+                instruments.append(InstrumentState(
+                    config=InstrumentConfig(name=sym, exchange_segment="NSE_EQ",
+                        security_id=sid, product_type="INTRADAY", lot_multiplier=1),
+                    api_qty=nq))
+            for sym, lv in [("GOLDTEN", self.gold_lots_var), ("SILVERMICRO", self.silv_lots_var)]:
+                m = resolve_mcx_future(rows, sym, allow_pick=False)
+                if not m: continue
+                mult = MCX_LOT_MULTIPLIERS[sym]
+                instruments.append(InstrumentState(
+                    config=InstrumentConfig(name=sym, exchange_segment="MCX_COMM",
+                        security_id=m["security_id"], product_type="INTRADAY",
+                        lot_multiplier=mult, trading_symbol=m["trading_symbol"],
+                        expiry=m["expiry"]),
+                    api_qty=lv.get() * mult))
+            if instruments:
+                self.instruments = instruments
+                self.after(0, self._build_instrument_rows)
+                self.after(0, lambda: self._append_log(
+                    f"[AUTO] {len(instruments)} instruments pre-loaded — ready to START."))
+        except Exception as e:
+            self.after(0, lambda err=str(e): self._append_log(f"[AUTO PRE-LOAD] {err}"))
 
     def _build_ui(self):
         top=ctk.CTkFrame(self,fg_color=C_HEADER,height=52,corner_radius=0)

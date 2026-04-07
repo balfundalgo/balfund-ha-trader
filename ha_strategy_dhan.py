@@ -41,24 +41,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ANSI COLOURS (VSCode terminal supports these)
+#  GUI LOG CALLBACK  (replaces terminal print in background threads)
 # ─────────────────────────────────────────────────────────────────────────────
-GRN  = "\033[92m"
-RED  = "\033[91m"
-YEL  = "\033[93m"
-BLU  = "\033[94m"
-CYN  = "\033[96m"
-GRY  = "\033[90m"
-BOLD = "\033[1m"
-RST  = "\033[0m"
+_gui_log_callback = None   # set by HATradingApp after construction
 
-def green(s):  return f"{GRN}{s}{RST}"
-def red(s):    return f"{RED}{s}{RST}"
-def yellow(s): return f"{YEL}{s}{RST}"
-def blue(s):   return f"{BLU}{s}{RST}"
-def cyan(s):   return f"{CYN}{s}{RST}"
-def grey(s):   return f"{GRY}{s}{RST}"
-def bold(s):   return f"{BOLD}{s}{RST}"
+def _gui_log(msg: str):
+    if _gui_log_callback:
+        try:
+            _gui_log_callback(msg)
+        except Exception:
+            pass
+
+# Stub helpers used by resolve functions (no ANSI in GUI build)
+def green(s):  return s
+def red(s):    return s
+def yellow(s): return s
+def cyan(s):   return s
+def bold(s):   return s
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  DHAN API ENDPOINTS
@@ -280,13 +279,13 @@ def load_master_csv() -> List[Dict[str, str]]:
 
     if use_cache:
         age_h = (time.time() - MASTER_CSV_CACHE.stat().st_mtime) / 3600
-        print(f"  {green('✓')} Using cached master CSV  ({age_h:.1f}h old)  →  {MASTER_CSV_CACHE}")
+        _gui_log(f"  {green('✓')} Using cached master CSV  ({age_h:.1f}h old)  →  {MASTER_CSV_CACHE}")
         with open(MASTER_CSV_CACHE, encoding="utf-8", errors="replace") as f:
             reader = csv.DictReader(f)
             return [{k.strip(): (v.strip() if isinstance(v, str) else v)
                      for k, v in row.items()} for row in reader]
 
-    print("  Downloading Dhan instrument master CSV  (~50 MB) — please wait ...")
+    _gui_log("  Downloading Dhan instrument master CSV  (~50 MB) — please wait ...")
     resp = requests.get(INSTRUMENT_MASTER_URL, timeout=120, stream=True)
     resp.raise_for_status()
 
@@ -300,13 +299,13 @@ def load_master_csv() -> List[Dict[str, str]]:
         mb = downloaded / 1_048_576
         if total:
             pct = downloaded / total * 100
-            print(f"\r    {mb:.1f} MB / {total/1_048_576:.1f} MB  ({pct:.0f}%)", end="", flush=True)
+            _gui_log(f"    {mb:.1f} MB / {total/1_048_576:.1f} MB  ({pct:.0f}%)")
         else:
-            print(f"\r    {mb:.1f} MB downloaded ...", end="", flush=True)
+            _gui_log(f"    {mb:.1f} MB downloaded ...")
 
-    print()   # newline after progress bar
+    _gui_log()   # newline after progress bar
     MASTER_CSV_CACHE.write_bytes(content)
-    print(f"  {green('✓')} Saved to cache → {MASTER_CSV_CACHE}")
+    _gui_log(f"  {green('✓')} Saved to cache → {MASTER_CSV_CACHE}")
 
     text   = content.decode("utf-8", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
@@ -319,7 +318,7 @@ def load_master_csv() -> List[Dict[str, str]]:
 
 def resolve_nse_stocks(rows: List[Dict[str, str]], symbols: List[str]) -> Dict[str, str]:
     """One-pass index build → O(n) total, not O(n × m)."""
-    print("  Building NSE_EQ index ...")
+    _gui_log("  Building NSE_EQ index ...")
     index: Dict[str, str] = {}
     for row in rows:
         if row.get("SEM_EXM_EXCH_ID", "").strip().upper() != "NSE":
@@ -336,9 +335,9 @@ def resolve_nse_stocks(rows: List[Dict[str, str]], symbols: List[str]) -> Dict[s
         sid = index.get(sym.upper())
         if sid:
             result[sym] = sid
-            print(f"    {green('✓')} {sym:<15}  sid={sid}")
+            _gui_log(f"    {green('✓')} {sym:<15}  sid={sid}")
         else:
-            print(f"    {yellow('✗')} {sym:<15}  NOT FOUND — will skip")
+            _gui_log(f"    {yellow('✗')} {sym:<15}  NOT FOUND — will skip")
     return result
 
 
@@ -421,10 +420,10 @@ def resolve_mcx_future(
         found.append((expiry_dt, sid, trading_sym))
 
     if not found:
-        print(f"    NOT FOUND: {prefix}  (tried: {variants})")
-        print(f"    Sample MCX rows from CSV:")
+        _gui_log(f"    NOT FOUND: {prefix}  (tried: {variants})")
+        _gui_log(f"    Sample MCX rows from CSV:")
         for s in mcx_samples:
-            print(f"      {s}")
+            _gui_log(f"      {s}")
         return None
 
     active  = sorted(
@@ -436,16 +435,16 @@ def resolve_mcx_future(
 
     if not ordered:
         expired = [(e, s, t) for e, s, t in found if e and e < today]
-        print(f"    Only expired futures for {prefix}:")
+        _gui_log(f"    Only expired futures for {prefix}:")
         for e, s, t in expired[:3]:
-            print(f"      contract={t}  expiry={e}  sid={s}")
+            _gui_log(f"      contract={t}  expiry={e}  sid={s}")
         return None
 
-    print(f"    Found {len(ordered)} active future(s) for {bold(prefix)}:")
+    _gui_log(f"    Found {len(ordered)} active future(s) for {bold(prefix)}:")
     for i, (e, s, t) in enumerate(ordered[:6]):
         exp_str = str(e) if e else "unknown"
         marker  = green(f"  [{i+1}]") if i == 0 else grey(f"  [{i+1}]")
-        print(f"    {marker} contract={cyan(t):<38} expiry={exp_str:<12} sid={s}")
+        _gui_log(f"    {marker} contract={cyan(t):<38} expiry={exp_str:<12} sid={s}")
 
     if len(ordered) == 1 or not allow_pick:
         chosen = ordered[0]
@@ -460,7 +459,7 @@ def resolve_mcx_future(
 
     e, sid, trading_sym = chosen
     expiry_out = str(e) if e else "unknown"
-    print(f"    {green(chr(10003))} {prefix:<15} -> sid={sid}  "
+    _gui_log(f"    {green(chr(10003))} {prefix:<15} -> sid={sid}  "
           f"contract={cyan(trading_sym)}  expiry={expiry_out}")
     return {"security_id": sid, "trading_symbol": trading_sym, "expiry": expiry_out}
 
@@ -983,725 +982,406 @@ class StrategyEngine:
         self._open_position(st, new_dir)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  GUI APPLICATION  (CustomTkinter dark theme)
-# ─────────────────────────────────────────────────────────────────────────────
-
-import customtkinter as ctk
-
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
-
-# Palette
-C_GREEN  = "#1db954"
-C_RED    = "#e05252"
-C_YELLOW = "#f0a500"
-C_BLUE   = "#4a9eff"
-C_GRAY   = "#888888"
-C_BG     = "#0f0f1a"
-C_FRAME  = "#16213e"
-C_ROW_A  = "#131a2e"
-C_ROW_B  = "#0f1520"
-C_HEADER = "#1a2540"
-
-# ── Column definitions ────────────────────────────────────────────────────────
-COLS = [
-    ("#",        35),  ("Symbol",   145), ("Exch",    55),
-    ("HA Open",  88),  ("HA Close",  88), ("Color",   72),
-    ("Signal",   62),  ("Position",  74), ("Entry ₹", 90),
-    ("Qty",      46),  ("LTP ₹",    90),  ("P&L ₹",  95),
-    ("Bar",      54),  ("Status",  185),
-]
-
-
-class InstrumentRow:
-    """One row of widgets inside the scrollable frame."""
-
-    def __init__(self, parent, idx: int, st: InstrumentState, bg: str):
-        self.st   = st
-        self._bg  = bg
-        self.frame = ctk.CTkFrame(parent, fg_color=bg, height=30, corner_radius=3)
-        self.frame.pack(fill="x", padx=2, pady=1)
-        self.frame.pack_propagate(False)
-
-        self._labels: list = []
-        x = 4
-
-        for col_idx, (_, w) in enumerate(COLS):
-            lbl = ctk.CTkLabel(
-                self.frame, text="-", width=w, anchor="center",
-                font=ctk.CTkFont(size=11), text_color=C_GRAY,
-            )
-            lbl.place(x=x, rely=0.5, anchor="w")
-            self._labels.append(lbl)
-            x += w + 2
-
-        # Index label
-        self._labels[0].configure(text=str(idx), text_color=C_GRAY)
-        # Symbol
-        self._labels[1].configure(
-            text=st.config.name, text_color="white",
-            font=ctk.CTkFont(size=11, weight="bold"), anchor="w",
-        )
-        # Exchange badge
-        exch_color = C_YELLOW if st.config.is_mcx else C_BLUE
-        self._labels[2].configure(
-            text="MCX" if st.config.is_mcx else "NSE", text_color=exch_color,
-        )
-
-    def update(self, nse_qty: int, gold_lots: int, silver_lots: int):
-        st = self.st
-
-        # HA Open
-        self._labels[3].configure(
-            text=f"{st.ha_open:.2f}" if st.ha_open else "-",
-            text_color="white",
-        )
-        # HA Close
-        self._labels[4].configure(
-            text=f"{st.ha_close:.2f}" if st.ha_close else "-",
-            text_color="white",
-        )
-        # Color
-        col_map = {"GREEN": C_GREEN, "RED": C_RED, "DOJI": C_YELLOW}
-        self._labels[5].configure(
-            text=st.color if st.color != "-" else "-",
-            text_color=col_map.get(st.color, C_GRAY),
-        )
-        # Signal
-        sig_map = {"BUY": C_GREEN, "SELL": C_RED}
-        self._labels[6].configure(
-            text=st.last_signal,
-            text_color=sig_map.get(st.last_signal, C_GRAY),
-        )
-        # Position
-        pos_map = {"LONG": C_GREEN, "SHORT": C_RED, "FLAT": C_GRAY}
-        self._labels[7].configure(
-            text=st.position,
-            text_color=pos_map.get(st.position, C_GRAY),
-        )
-        # Entry
-        self._labels[8].configure(
-            text=f"{st.entry_price:.2f}" if st.entry_price else "-",
-            text_color="white",
-        )
-        # Qty
-        if st.position != "FLAT":
-            qty_display = str(st.user_qty)
-        else:
-            if st.config.is_mcx:
-                qty_display = str(gold_lots if st.config.name == "GOLDTEN" else silver_lots)
-            else:
-                qty_display = str(nse_qty)
-        self._labels[9].configure(text=qty_display, text_color=C_GRAY)
-
-        # LTP
-        self._labels[10].configure(
-            text=f"{st.last_ltp:.2f}" if st.last_ltp else "-",
-            text_color="white",
-        )
-        # P&L
-        pnl = st.unrealized_pnl
-        if st.position == "FLAT":
-            self._labels[11].configure(text="-", text_color=C_GRAY)
-        else:
-            pnl_color = C_GREEN if pnl >= 0 else C_RED
-            self._labels[11].configure(
-                text=f"₹{pnl:+.2f}", text_color=pnl_color,
-            )
-        # Bar time
-        self._labels[12].configure(
-            text=st.bar_time or "-", text_color=C_GRAY,
-        )
-        # Status
-        s = st.status[:32]
-        sc = C_GRAY
-        if "Err" in s:                sc = C_RED
-        elif "[P] LONG" in s or "Entered LONG" in s:  sc = C_GREEN
-        elif "[P] SHORT" in s or "Entered SHORT" in s: sc = C_RED
-        elif "Holding ↑" in s:       sc = C_GREEN
-        elif "Holding ↓" in s:       sc = C_RED
-        elif "Closed" in s:          sc = C_YELLOW
-        elif "Mkt Closed" in s:      sc = C_GRAY
-        self._labels[13].configure(text=s, text_color=sc)
-
-
-class HATradingApp(ctk.CTk):
-
-    def __init__(self):
-        super().__init__()
-        self.title("Balfund  HA + SMA(1)  Strategy Trader  v1.0")
-        self.geometry("1720x920")
-        self.minsize(1400, 700)
-        self.configure(fg_color=C_BG)
-
-        # State
-        self.engine:      Optional[StrategyEngine] = None
-        self.instruments: List[InstrumentState]    = []
-        self.running:     bool = False
-        self._rows:       List[InstrumentRow] = []
-
-        # Config vars
-        self.interval_var  = ctk.StringVar(value="5")
-        self.nse_qty_var   = ctk.IntVar(value=10)
-        self.gold_lots_var = ctk.IntVar(value=1)
-        self.silv_lots_var = ctk.IntVar(value=1)
-        self.nse_sq_var    = ctk.StringVar(value="15:15")
-        self.mcx_sq_var    = ctk.StringVar(value="23:25")
-        self.paper_var     = ctk.BooleanVar(value=True)
-
-        self._build_ui()
-        self.after(1500, self._gui_tick)
-
-    # ─────────────────────────────────────────────────────────
-    # UI BUILD
-    # ─────────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        # ── Top bar ──────────────────────────────────────────
-        top = ctk.CTkFrame(self, fg_color=C_HEADER, height=52, corner_radius=0)
-        top.pack(fill="x")
-        top.pack_propagate(False)
-
-        ctk.CTkLabel(
-            top,
-            text="📈  BALFUND   HA + SMA(1)  STRATEGY TRADER",
-            font=ctk.CTkFont(size=17, weight="bold"),
-            text_color=C_BLUE,
-        ).pack(side="left", padx=18)
-
-        self.pnl_lbl = ctk.CTkLabel(
-            top, text="Net P&L:  ₹0.00",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=C_YELLOW,
-        )
-        self.pnl_lbl.pack(side="right", padx=18)
-
-        self.clock_lbl = ctk.CTkLabel(
-            top, text="", font=ctk.CTkFont(size=12), text_color=C_GRAY,
-        )
-        self.clock_lbl.pack(side="right", padx=12)
-
-        self.ws_lbl = ctk.CTkLabel(
-            top, text="WS: —", font=ctk.CTkFont(size=11), text_color=C_GRAY,
-        )
-        self.ws_lbl.pack(side="right", padx=12)
-
-        self.mode_lbl = ctk.CTkLabel(
-            top, text="● PAPER", font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=C_YELLOW,
-        )
-        self.mode_lbl.pack(side="right", padx=12)
-
-        # ── Tabs ─────────────────────────────────────────────
-        self.tabs = ctk.CTkTabview(self, fg_color=C_BG, segmented_button_selected_color=C_BLUE)
-        self.tabs.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-
-        self.tabs.add("⚙  Settings")
-        self.tabs.add("📊  Live Strategy")
-        self.tabs.add("📋  Log")
-
-        self._build_settings(self.tabs.tab("⚙  Settings"))
-        self._build_strategy(self.tabs.tab("📊  Live Strategy"))
-        self._build_log(self.tabs.tab("📋  Log"))
-
-    # ── SETTINGS TAB ─────────────────────────────────────────
-
-    def _build_settings(self, parent):
-        parent.configure(fg_color=C_BG)
-        parent.grid_columnconfigure((0, 1, 2, 3), weight=1)
-
-        # Timeframe
-        tf = ctk.CTkFrame(parent, fg_color=C_FRAME, corner_radius=10)
-        tf.grid(row=0, column=0, padx=10, pady=12, sticky="nsew")
-        ctk.CTkLabel(tf, text="Candle Timeframe",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=C_BLUE).pack(pady=(14, 8))
-        for val, label in [("1","1 Minute"), ("5","5 Minutes"), ("15","15 Minutes")]:
-            ctk.CTkRadioButton(tf, text=label, variable=self.interval_var,
-                               value=val, font=ctk.CTkFont(size=12)).pack(
-                anchor="w", padx=22, pady=5)
-        tf.pack_propagate(False)
-
-        # Quantity
-        qf = ctk.CTkFrame(parent, fg_color=C_FRAME, corner_radius=10)
-        qf.grid(row=0, column=1, padx=10, pady=12, sticky="nsew")
-        ctk.CTkLabel(qf, text="Quantity per Trade",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=C_BLUE).pack(pady=(14, 8))
-        for label, var, unit in [
-            ("NSE Stocks:", self.nse_qty_var, "shares"),
-            ("GOLDTEN:",    self.gold_lots_var, "lots"),
-            ("SILVERMICRO:", self.silv_lots_var, "lots"),
-        ]:
-            row = ctk.CTkFrame(qf, fg_color="transparent")
-            row.pack(fill="x", padx=16, pady=5)
-            ctk.CTkLabel(row, text=label, width=130, anchor="w",
-                         font=ctk.CTkFont(size=12)).pack(side="left")
-            ctk.CTkEntry(row, textvariable=var, width=70,
-                         font=ctk.CTkFont(size=12)).pack(side="left", padx=6)
-            ctk.CTkLabel(row, text=unit, text_color=C_GRAY,
-                         font=ctk.CTkFont(size=11)).pack(side="left")
-
-        # Square-off
-        sf = ctk.CTkFrame(parent, fg_color=C_FRAME, corner_radius=10)
-        sf.grid(row=0, column=2, padx=10, pady=12, sticky="nsew")
-        ctk.CTkLabel(sf, text="Auto Square-off",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=C_BLUE).pack(pady=(14, 8))
-        for label, var in [("NSE (HH:MM):", self.nse_sq_var),
-                           ("MCX (HH:MM):", self.mcx_sq_var)]:
-            row = ctk.CTkFrame(sf, fg_color="transparent")
-            row.pack(fill="x", padx=16, pady=8)
-            ctk.CTkLabel(row, text=label, width=120, anchor="w",
-                         font=ctk.CTkFont(size=12)).pack(side="left")
-            ctk.CTkEntry(row, textvariable=var, width=90,
-                         font=ctk.CTkFont(size=13)).pack(side="left", padx=6)
-        ctk.CTkLabel(sf, text="NSE: 09:15 – 15:30\nMCX: 09:00 – 23:30",
-                     text_color=C_GRAY, font=ctk.CTkFont(size=11),
-                     justify="left").pack(padx=16, pady=6, anchor="w")
-
-        # Mode
-        mf = ctk.CTkFrame(parent, fg_color=C_FRAME, corner_radius=10)
-        mf.grid(row=0, column=3, padx=10, pady=12, sticky="nsew")
-        ctk.CTkLabel(mf, text="Trading Mode",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=C_BLUE).pack(pady=(14, 12))
-        ctk.CTkSwitch(
-            mf, text="Paper Mode (safe)",
-            variable=self.paper_var,
-            font=ctk.CTkFont(size=12),
-            onvalue=True, offvalue=False,
-            progress_color=C_YELLOW,
-        ).pack(padx=22, pady=4, anchor="w")
-        self.paper_warn = ctk.CTkLabel(
-            mf, text="⚠  Switch OFF for live orders",
-            text_color=C_RED, font=ctk.CTkFont(size=11),
-        )
-        self.paper_warn.pack(padx=22, pady=4, anchor="w")
-
-        # Control buttons
-        btn_row = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_row.grid(row=1, column=0, columnspan=4, pady=16)
-
-        self.start_btn = ctk.CTkButton(
-            btn_row, text="▶  START STRATEGY",
-            width=220, height=48,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=C_GREEN, hover_color="#17a844",
-            command=self._on_start,
-        )
-        self.start_btn.pack(side="left", padx=12)
-
-        self.stop_btn = ctk.CTkButton(
-            btn_row, text="■  STOP",
-            width=140, height=48,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color=C_RED, hover_color="#c43a3a",
-            command=self._on_stop, state="disabled",
-        )
-        self.stop_btn.pack(side="left", padx=12)
-
-        self.status_lbl = ctk.CTkLabel(
-            parent, text="Not started",
-            text_color=C_GRAY, font=ctk.CTkFont(size=12),
-        )
-        self.status_lbl.grid(row=2, column=0, columnspan=4, pady=4)
-
-    # ── STRATEGY TAB ─────────────────────────────────────────
-
-    def _build_strategy(self, parent):
-        parent.configure(fg_color=C_BG)
-
-        # Column header bar
-        hdr = ctk.CTkFrame(parent, fg_color=C_HEADER, height=30, corner_radius=4)
-        hdr.pack(fill="x", padx=4, pady=(4, 0))
-        hdr.pack_propagate(False)
-        x = 4
-        for name, w in COLS:
-            ctk.CTkLabel(
-                hdr, text=name, width=w, anchor="center",
-                font=ctk.CTkFont(size=10, weight="bold"),
-                text_color=C_BLUE,
-            ).place(x=x, rely=0.5, anchor="w")
-            x += w + 2
-
-        # Per-instrument action bar (sq-off / skip)
-        self.action_bar = ctk.CTkFrame(parent, fg_color=C_FRAME, height=36, corner_radius=4)
-        self.action_bar.pack(fill="x", padx=4, pady=(2, 0))
-        self.action_bar.pack_propagate(False)
-        ctk.CTkLabel(
-            self.action_bar, text="Select symbol then:", text_color=C_GRAY,
-            font=ctk.CTkFont(size=11),
-        ).pack(side="left", padx=10)
-
-        self.sqoff_btn = ctk.CTkButton(
-            self.action_bar, text="Manual Sq.Off",
-            width=130, height=26,
-            fg_color=C_RED, hover_color="#c43a3a",
-            font=ctk.CTkFont(size=11),
-            command=self._manual_sqoff,
-        )
-        self.sqoff_btn.pack(side="left", padx=6)
-
-        self.skip_btn = ctk.CTkButton(
-            self.action_bar, text="Toggle Skip",
-            width=110, height=26,
-            fg_color="#555555", hover_color="#333333",
-            font=ctk.CTkFont(size=11),
-            command=self._toggle_skip,
-        )
-        self.skip_btn.pack(side="left", padx=4)
-
-        self.selected_sym_lbl = ctk.CTkLabel(
-            self.action_bar, text="(no row selected)",
-            text_color=C_GRAY, font=ctk.CTkFont(size=11),
-        )
-        self.selected_sym_lbl.pack(side="left", padx=10)
-
-        # Summary bar
-        self.summary_bar = ctk.CTkFrame(parent, fg_color=C_FRAME, height=28, corner_radius=4)
-        self.summary_bar.pack(fill="x", padx=4, pady=(2, 0))
-        self.summary_bar.pack_propagate(False)
-        self.summary_lbl = ctk.CTkLabel(
-            self.summary_bar,
-            text="0 LONG   0 SHORT   Next poll: —",
-            font=ctk.CTkFont(size=11), text_color=C_GRAY,
-        )
-        self.summary_lbl.pack(side="left", padx=10, pady=2)
-
-        # Scrollable rows
-        self.scroll = ctk.CTkScrollableFrame(parent, fg_color=C_BG, corner_radius=0)
-        self.scroll.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self._selected_idx: Optional[int] = None
-
-    def _build_instrument_rows(self):
-        for w in self.scroll.winfo_children():
-            w.destroy()
-        self._rows.clear()
-        self._selected_idx = None
-
-        for idx, st in enumerate(self.instruments):
-            bg = C_ROW_A if idx % 2 == 0 else C_ROW_B
-            row = InstrumentRow(self.scroll, idx + 1, st, bg)
-            # Click to select
-            def _click(event, i=idx):
-                self._select_row(i)
-            row.frame.bind("<Button-1>", _click)
-            for lbl in row._labels:
-                lbl.bind("<Button-1>", _click)
-            self._rows.append(row)
-
-    def _select_row(self, idx: int):
-        # Deselect old
-        if self._selected_idx is not None and self._selected_idx < len(self._rows):
-            old = self._rows[self._selected_idx]
-            old.frame.configure(fg_color=old._bg)
-        # Select new
-        self._selected_idx = idx
-        row = self._rows[idx]
-        row.frame.configure(fg_color="#1a3a5c")
-        self.selected_sym_lbl.configure(
-            text=self.instruments[idx].config.name, text_color="white",
-        )
-
-    # ── LOG TAB ──────────────────────────────────────────────
-
-    def _build_log(self, parent):
-        parent.configure(fg_color=C_BG)
-        self.log_box = ctk.CTkTextbox(
-            parent,
-            font=ctk.CTkFont(family="Courier", size=11),
-            fg_color="#0a0a14",
-            text_color="#cccccc",
-        )
-        self.log_box.pack(fill="both", expand=True, padx=6, pady=6)
-        ctk.CTkButton(
-            parent, text="Clear Log", width=100,
-            command=lambda: self.log_box.delete("0.0", "end"),
-        ).pack(side="right", padx=8, pady=4)
-
-    def _append_log(self, msg: str):
-        try:
-            self.log_box.insert("end", msg + "\n")
-            self.log_box.see("end")
-        except Exception:
-            pass
-
-    # ─────────────────────────────────────────────────────────
-    # BUTTON HANDLERS
-    # ─────────────────────────────────────────────────────────
-
-    def _on_start(self):
-        self.start_btn.configure(state="disabled", text="Resolving...")
-        self.status_lbl.configure(text="Fetching token & resolving instruments...",
-                                  text_color=C_YELLOW)
-        threading.Thread(target=self._resolve_and_start, daemon=True).start()
-
-    def _on_stop(self):
-        if self.engine:
-            self.engine.stop()
-        self.running = False
-        self.start_btn.configure(state="normal", text="▶  START STRATEGY")
-        self.stop_btn.configure(state="disabled")
-        self.status_lbl.configure(text="Stopped", text_color=C_GRAY)
-        self._append_log("[INFO] Strategy stopped by user.")
-
-    def _manual_sqoff(self):
-        if self._selected_idx is None or not self.engine:
-            return
-        name = self.instruments[self._selected_idx].config.name
-        threading.Thread(
-            target=self.engine.manual_squareoff, args=(name,), daemon=True,
-        ).start()
-
-    def _toggle_skip(self):
-        if self._selected_idx is None:
-            return
-        st = self.instruments[self._selected_idx]
-        st.skip = not st.skip
-        label = f"SKIP: {st.config.name}" if st.skip else st.config.name
-        self.selected_sym_lbl.configure(
-            text=f"{label}  ({'skipped' if st.skip else 'active'})",
-            text_color=C_YELLOW if st.skip else "white",
-        )
-
-    # ─────────────────────────────────────────────────────────
-    # RESOLVE + START (background thread)
-    # ─────────────────────────────────────────────────────────
-
-    def _log_bg(self, msg: str):
-        """Thread-safe log from background."""
-        self.after(0, lambda m=msg: self._append_log(m))
-
-    def _resolve_and_start(self):
-        try:
-            # Token
-            self._log_bg("[1/4] Fetching token from Token Generator ...")
-            client_id, access_token = fetch_token_from_generator()
-            self._log_bg(f"      Client: {client_id}  Token: {access_token[:20]}...")
-
-            # Master CSV
-            self._log_bg("[2/4] Loading instrument master CSV ...")
-            rows = load_master_csv()
-            self._log_bg(f"      {len(rows):,} rows loaded.")
-
-            # NSE stocks
-            self._log_bg("[3/4] Resolving NSE stocks ...")
-            nse_ids = resolve_nse_stocks(rows, NSE_STOCKS)
-            instruments: List[InstrumentState] = []
-            nse_qty = self.nse_qty_var.get()
-            for sym in NSE_STOCKS:
-                sid = nse_ids.get(sym)
-                if not sid:
-                    continue
-                cfg_i = InstrumentConfig(
-                    name=sym, exchange_segment="NSE_EQ",
-                    security_id=sid, product_type="INTRADAY", lot_multiplier=1,
-                )
-                instruments.append(InstrumentState(config=cfg_i, api_qty=nse_qty))
-
-            # MCX futures
-            self._log_bg("[4/4] Resolving MCX futures ...")
-            for sym, lots_var in [("GOLDTEN", self.gold_lots_var),
-                                  ("SILVERMICRO", self.silv_lots_var)]:
-                match = resolve_mcx_future(rows, sym, allow_pick=False)
-                if not match:
-                    self._log_bg(f"      WARNING: {sym} not resolved — skipping")
-                    continue
-                mult  = MCX_LOT_MULTIPLIERS[sym]
-                cfg_i = InstrumentConfig(
-                    name=sym, exchange_segment="MCX_COMM",
-                    security_id=match["security_id"],
-                    product_type="INTRADAY",
-                    lot_multiplier=mult,
-                    trading_symbol=match["trading_symbol"],
-                    expiry=match["expiry"],
-                )
-                instruments.append(
-                    InstrumentState(config=cfg_i, api_qty=lots_var.get() * mult)
-                )
-
-            self._log_bg(f"      {len(instruments)} instruments resolved.")
-
-            if not instruments:
-                self.after(0, lambda: self._on_start_error("No instruments resolved."))
-                return
-
-            self.instruments = instruments
-            self.after(0, self._on_resolved)
-
-        except Exception as e:
-            self.after(0, lambda err=str(e): self._on_start_error(err))
-
-    def _on_resolved(self):
-        self._build_instrument_rows()
-
-        paper = self.paper_var.get()
-        self.engine = StrategyEngine(
-            client_id="",  # engine reads via fetch_token_from_generator
-            access_token="",
-            instruments=self.instruments,
-            interval=self.interval_var.get(),
-            nse_sq_time=self.nse_sq_var.get(),
-            mcx_sq_time=self.mcx_sq_var.get(),
-            paper_mode=paper,
-        )
-        # Patch engine credentials from token fetch
-        threading.Thread(target=self._patch_engine_token, daemon=True).start()
-
-        self.engine.start()
-        self.running = True
-
-        self.start_btn.configure(state="disabled", text="▶  RUNNING")
-        self.stop_btn.configure(state="normal")
-        mode_txt = "● PAPER" if paper else "● LIVE"
-        mode_col = C_YELLOW if paper else C_RED
-        self.mode_lbl.configure(text=mode_txt, text_color=mode_col)
-        self.status_lbl.configure(
-            text=f"Running  |  TF={self.interval_var.get()}min  |  "
-                 f"{len(self.instruments)} instruments  |  "
-                 f"{'PAPER' if paper else 'LIVE'} mode",
-            text_color=C_GREEN,
-        )
-        self.tabs.set("📊  Live Strategy")
-
-    def _patch_engine_token(self):
-        """Fetch token again and patch into engine (needed after _on_resolved)."""
-        try:
-            client_id, access_token = fetch_token_from_generator()
-            self.engine.client_id    = client_id
-            self.engine.access_token = access_token
-            if self.engine._ws_client:
-                self.engine._ws_client.client_id    = client_id
-                self.engine._ws_client.access_token = access_token
-        except Exception:
-            pass
-
-    def _on_start_error(self, err: str):
-        self._append_log(f"[ERROR] {err}")
-        self.start_btn.configure(state="normal", text="▶  START STRATEGY")
-        self.status_lbl.configure(text=f"Error: {err[:80]}", text_color=C_RED)
-
-    # ─────────────────────────────────────────────────────────
-    # GUI UPDATE LOOP  (every 2 seconds)
-    # ─────────────────────────────────────────────────────────
-
-    def _gui_tick(self):
-        try:
-            # Clock
-            self.clock_lbl.configure(
-                text=datetime.now().strftime("🕐  %H:%M:%S   %d %b %Y")
-            )
-
-            if self.running and self.engine:
-                # Drain engine log
-                for line in self.engine.get_logs(20):
-                    # Only show new lines (simple dedup by checking log_box)
-                    self._append_log(line)
-                # Clear engine log after draining so we don't repeat
-                with self.engine.lock:
-                    self.engine._log_lines.clear()
-
-                # P&L
-                total_pnl = sum(s.unrealized_pnl for s in self.instruments)
-                pnl_color = C_GREEN if total_pnl >= 0 else C_RED
-                self.pnl_lbl.configure(
-                    text=f"Net P&L:  ₹{total_pnl:+.2f}", text_color=pnl_color,
-                )
-
-                # WS status
-                ws_st = self.engine.ws_status
-                if "subscribed" in ws_st.lower() or "connected" in ws_st.lower():
-                    ws_txt = f"WS ✓  {self.engine.ws_ticks} ticks"
-                    ws_col = C_GREEN
-                elif "error" in ws_st.lower() or "closed" in ws_st.lower():
-                    ws_txt = f"WS ✗  {ws_st[:20]}"
-                    ws_col = C_RED
-                else:
-                    ws_txt = f"WS …  {ws_st[:20]}"
-                    ws_col = C_YELLOW
-                self.ws_lbl.configure(text=ws_txt, text_color=ws_col)
-
-                # Summary bar
-                longs  = sum(1 for s in self.instruments if s.position == "LONG")
-                shorts = sum(1 for s in self.instruments if s.position == "SHORT")
-                self.summary_lbl.configure(
-                    text=f"{longs} LONG   {shorts} SHORT"
-                         f"   Next poll: {self.engine.next_poll_at}"
-                         f"   REST poll + WS live LTP",
-                    text_color=C_GRAY,
-                )
-
-                # Update each row
-                nq = self.nse_qty_var.get()
-                gl = self.gold_lots_var.get()
-                sl = self.silv_lots_var.get()
-                for row in self._rows:
-                    row.update(nq, gl, sl)
-
-        except Exception as e:
-            pass
-        finally:
-            self.after(2000, self._gui_tick)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TOKEN LOADER
 # ─────────────────────────────────────────────────────────────────────────────
-
 TOKEN_SERVER_URL  = "http://localhost:5555/token"
 TOKEN_SHARED_FILE = r"C:\balfund_shared\dhan_token.json"
 
-
 def fetch_token_from_generator() -> tuple:
-    # Method 1: HTTP
     try:
         resp = requests.get(TOKEN_SERVER_URL, timeout=3)
         if resp.status_code == 200:
             d = resp.json()
-            c, t = d.get("client_id","").strip(), d.get("access_token","").strip()
-            if c and t:
-                return c, t
-    except Exception:
-        pass
-
-    # Method 2: Shared file
+            c = d.get("client_id","").strip()
+            t = d.get("access_token","").strip()
+            if c and t: return c, t
+    except Exception: pass
     try:
         with open(TOKEN_SHARED_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        c, t = d.get("client_id","").strip(), d.get("access_token","").strip()
-        if c and t:
-            return c, t
-    except Exception:
-        pass
-
-    # Method 3: .env fallback
+        c = d.get("client_id","").strip()
+        t = d.get("access_token","").strip()
+        if c and t: return c, t
+    except Exception: pass
     try:
         from dhan_token_manager import load_config
         cfg = load_config()
-        c   = cfg.get("client_id","").strip()
-        t   = cfg.get("access_token","").strip()
-        if c and t:
-            return c, t
-    except Exception:
-        pass
-
+        c = cfg.get("client_id","").strip()
+        t = cfg.get("access_token","").strip()
+        if c and t: return c, t
+    except Exception: pass
     raise RuntimeError(
-        "Token not found!\n\n"
-        "Please open token_generator.exe and click Generate Token first."
+        "Token not found!\n\nPlease open Balfund_Token_Generator.exe and click Generate Token."
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MAIN
+#  GUI APPLICATION
 # ─────────────────────────────────────────────────────────────────────────────
+import sys
+import customtkinter as ctk
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+C_GREEN="#1db954"; C_RED="#e05252"; C_YELLOW="#f0a500"; C_BLUE="#4a9eff"
+C_GRAY="#888888";  C_BG="#0f0f1a"; C_FRAME="#16213e";  C_ROW_A="#131a2e"
+C_ROW_B="#0f1520"; C_HEADER="#1a2540"; C_SEL="#1a3a5c"
+
+COLS=[
+    ("",32),("#",32),("Symbol / Contract",185),("Exch",50),
+    ("HA Open",88),("HA Close",88),("Color",68),("Signal",62),
+    ("Position",72),("Entry",90),("Qty",44),("LTP",90),
+    ("P&L",100),("Bar",50),("Status",175),
+]
+CI_CHK=0;CI_IDX=1;CI_SYM=2;CI_EXCH=3;CI_HAO=4;CI_HAC=5
+CI_COL=6;CI_SIG=7;CI_POS=8;CI_ENT=9;CI_QTY=10;CI_LTP=11
+CI_PNL=12;CI_BAR=13;CI_STA=14
+
+class InstrumentRow:
+    def __init__(self,parent,idx,st,bg,on_check,on_click):
+        self.st=st; self._bg=bg; self._idx=idx-1
+        self.frame=ctk.CTkFrame(parent,fg_color=bg,height=30,corner_radius=3)
+        self.frame.pack(fill="x",padx=2,pady=1)
+        self.frame.pack_propagate(False)
+        self.frame.bind("<Button-1>",lambda e,i=self._idx:on_click(i))
+        self._labels=[]; x=4
+        for ci,(_,w) in enumerate(COLS):
+            if ci==CI_CHK:
+                self._chk_var=ctk.BooleanVar(value=not st.skip)
+                cb=ctk.CTkCheckBox(self.frame,text="",variable=self._chk_var,
+                    width=w,checkbox_width=16,checkbox_height=16,
+                    command=lambda s=st:on_check(s,self._chk_var.get()))
+                cb.place(x=x,rely=0.5,anchor="w"); self._labels.append(cb)
+            else:
+                lbl=ctk.CTkLabel(self.frame,text="-",width=w,
+                    anchor="w" if ci==CI_SYM else "center",
+                    font=ctk.CTkFont(size=11),text_color=C_GRAY)
+                lbl.place(x=x,rely=0.5,anchor="w")
+                lbl.bind("<Button-1>",lambda e,i=self._idx:on_click(i))
+                self._labels.append(lbl)
+            x+=w+2
+        self._labels[CI_IDX].configure(text=str(idx),text_color=C_GRAY)
+        sym_txt=st.config.trading_symbol if (st.config.is_mcx and st.config.trading_symbol) else st.config.name
+        self._labels[CI_SYM].configure(text=sym_txt,text_color="white",
+            font=ctk.CTkFont(size=10,weight="bold"))
+        self._labels[CI_EXCH].configure(
+            text="MCX" if st.config.is_mcx else "NSE",
+            text_color=C_YELLOW if st.config.is_mcx else C_BLUE)
+
+    def set_selected(self,sel):
+        self.frame.configure(fg_color=C_SEL if sel else self._bg)
+
+    def update(self,nse_qty,gold_lots,silv_lots):
+        st=self.st
+        def lbl(ci,txt,clr="white"):
+            self._labels[ci].configure(text=str(txt),text_color=clr)
+        if st.skip:
+            for i in range(CI_HAO,CI_STA+1):
+                self._labels[i].configure(text="--",text_color=C_GRAY)
+            lbl(CI_STA,"Skipped",C_GRAY); return
+        lbl(CI_HAO,f"{st.ha_open:.2f}" if st.ha_open else "-")
+        lbl(CI_HAC,f"{st.ha_close:.2f}" if st.ha_close else "-")
+        lbl(CI_COL,st.color if st.color!="-" else "-",
+            {"GREEN":C_GREEN,"RED":C_RED,"DOJI":C_YELLOW}.get(st.color,C_GRAY))
+        lbl(CI_SIG,st.last_signal,{"BUY":C_GREEN,"SELL":C_RED}.get(st.last_signal,C_GRAY))
+        lbl(CI_POS,st.position,{"LONG":C_GREEN,"SHORT":C_RED,"FLAT":C_GRAY}.get(st.position,C_GRAY))
+        lbl(CI_ENT,f"{st.entry_price:.2f}" if st.entry_price else "-")
+        qty=(str(st.user_qty) if st.position!="FLAT"
+             else str(gold_lots if st.config.name=="GOLDTEN"
+                      else silv_lots if st.config.is_mcx else nse_qty))
+        lbl(CI_QTY,qty,C_GRAY)
+        lbl(CI_LTP,f"{st.last_ltp:.2f}" if st.last_ltp else "-")
+        pnl=st.unrealized_pnl
+        lbl(CI_PNL,"-" if st.position=="FLAT" else f"Rs {pnl:+.2f}",
+            C_GRAY if st.position=="FLAT" else (C_GREEN if pnl>=0 else C_RED))
+        lbl(CI_BAR,st.bar_time or "-",C_GRAY)
+        s=st.status[:35]
+        sc=(C_RED if "Err" in s else C_GREEN if "LONG" in s
+            else C_RED if "SHORT" in s else C_YELLOW if "Closed" in s else C_GRAY)
+        lbl(CI_STA,s,sc)
+
+
+class HATradingApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Balfund  HA + SMA(1)  Strategy Trader  v1.0")
+        self.geometry("1760x930"); self.minsize(1400,700)
+        self.configure(fg_color=C_BG)
+        global _gui_log_callback; _gui_log_callback=self._append_log
+        self.engine=None; self.instruments=[]; self.running=False
+        self._rows=[]; self._selected_idx=None
+        self._client_id=""; self._access_token=""
+        self.interval_var=ctk.StringVar(value="5")
+        self.nse_qty_var=ctk.IntVar(value=10)
+        self.gold_lots_var=ctk.IntVar(value=1)
+        self.silv_lots_var=ctk.IntVar(value=1)
+        self.nse_sq_var=ctk.StringVar(value="15:15")
+        self.mcx_sq_var=ctk.StringVar(value="23:25")
+        self.paper_var=ctk.BooleanVar(value=True)
+        self._build_ui(); self.after(2000,self._gui_tick)
+
+    def _build_ui(self):
+        top=ctk.CTkFrame(self,fg_color=C_HEADER,height=52,corner_radius=0)
+        top.pack(fill="x"); top.pack_propagate(False)
+        ctk.CTkLabel(top,text="  BALFUND   HA + SMA(1)  STRATEGY TRADER",
+            font=ctk.CTkFont(size=17,weight="bold"),text_color=C_BLUE).pack(side="left",padx=18)
+        self.pnl_lbl=ctk.CTkLabel(top,text="Net P&L:  Rs 0.00",
+            font=ctk.CTkFont(size=14,weight="bold"),text_color=C_YELLOW)
+        self.pnl_lbl.pack(side="right",padx=18)
+        self.clock_lbl=ctk.CTkLabel(top,text="",font=ctk.CTkFont(size=12),text_color=C_GRAY)
+        self.clock_lbl.pack(side="right",padx=12)
+        self.ws_lbl=ctk.CTkLabel(top,text="WS: --",font=ctk.CTkFont(size=11),text_color=C_GRAY)
+        self.ws_lbl.pack(side="right",padx=12)
+        self.mode_lbl=ctk.CTkLabel(top,text="PAPER",
+            font=ctk.CTkFont(size=12,weight="bold"),text_color=C_YELLOW)
+        self.mode_lbl.pack(side="right",padx=12)
+        self.tabs=ctk.CTkTabview(self,fg_color=C_BG,
+            segmented_button_selected_color=C_BLUE)
+        self.tabs.pack(fill="both",expand=True,padx=6,pady=(0,6))
+        for t in ["Settings","Live Strategy","Log"]: self.tabs.add(t)
+        self._build_settings(self.tabs.tab("Settings"))
+        self._build_strategy(self.tabs.tab("Live Strategy"))
+        self._build_log(self.tabs.tab("Log"))
+
+    def _build_settings(self,parent):
+        parent.configure(fg_color=C_BG)
+        parent.grid_columnconfigure((0,1,2,3),weight=1)
+        def card(col,title):
+            f=ctk.CTkFrame(parent,fg_color=C_FRAME,corner_radius=10)
+            f.grid(row=0,column=col,padx=10,pady=12,sticky="nsew")
+            ctk.CTkLabel(f,text=title,font=ctk.CTkFont(size=13,weight="bold"),
+                text_color=C_BLUE).pack(pady=(14,8)); return f
+        tf=card(0,"Candle Timeframe")
+        for v,l in [("1","1 Minute"),("5","5 Minutes"),("15","15 Minutes")]:
+            ctk.CTkRadioButton(tf,text=l,variable=self.interval_var,
+                value=v,font=ctk.CTkFont(size=12)).pack(anchor="w",padx=22,pady=5)
+        qf=card(1,"Quantity per Trade")
+        for l,v,u in [("NSE Stocks:",self.nse_qty_var,"shares"),
+                      ("GOLDTEN:",self.gold_lots_var,"lots"),
+                      ("SILVERMICRO:",self.silv_lots_var,"lots")]:
+            r=ctk.CTkFrame(qf,fg_color="transparent"); r.pack(fill="x",padx=16,pady=5)
+            ctk.CTkLabel(r,text=l,width=130,anchor="w",font=ctk.CTkFont(size=12)).pack(side="left")
+            ctk.CTkEntry(r,textvariable=v,width=70,font=ctk.CTkFont(size=12)).pack(side="left",padx=6)
+            ctk.CTkLabel(r,text=u,text_color=C_GRAY,font=ctk.CTkFont(size=11)).pack(side="left")
+        sf=card(2,"Auto Square-off")
+        for l,v in [("NSE (HH:MM):",self.nse_sq_var),("MCX (HH:MM):",self.mcx_sq_var)]:
+            r=ctk.CTkFrame(sf,fg_color="transparent"); r.pack(fill="x",padx=16,pady=8)
+            ctk.CTkLabel(r,text=l,width=120,anchor="w",font=ctk.CTkFont(size=12)).pack(side="left")
+            ctk.CTkEntry(r,textvariable=v,width=90,font=ctk.CTkFont(size=13)).pack(side="left",padx=6)
+        ctk.CTkLabel(sf,text="NSE: 09:15 to 15:30\nMCX: 09:00 to 23:30",
+            text_color=C_GRAY,font=ctk.CTkFont(size=11),justify="left").pack(padx=16,pady=6,anchor="w")
+        mf=card(3,"Trading Mode")
+        ctk.CTkSwitch(mf,text="Paper Mode (safe)",variable=self.paper_var,
+            font=ctk.CTkFont(size=12),onvalue=True,offvalue=False,
+            progress_color=C_YELLOW).pack(padx=22,pady=4,anchor="w")
+        ctk.CTkLabel(mf,text="Turn OFF for live orders",text_color=C_RED,
+            font=ctk.CTkFont(size=11)).pack(padx=22,pady=4,anchor="w")
+        btn_row=ctk.CTkFrame(parent,fg_color="transparent")
+        btn_row.grid(row=1,column=0,columnspan=4,pady=18)
+        self.start_btn=ctk.CTkButton(btn_row,text="START STRATEGY",
+            width=240,height=50,font=ctk.CTkFont(size=15,weight="bold"),
+            fg_color=C_GREEN,hover_color="#17a844",command=self._on_start)
+        self.start_btn.pack(side="left",padx=14)
+        self.stop_btn=ctk.CTkButton(btn_row,text="STOP",width=140,height=50,
+            font=ctk.CTkFont(size=15,weight="bold"),fg_color=C_RED,
+            hover_color="#c43a3a",command=self._on_stop,state="disabled")
+        self.stop_btn.pack(side="left",padx=14)
+        self.status_lbl=ctk.CTkLabel(parent,text="Not started",
+            text_color=C_GRAY,font=ctk.CTkFont(size=12))
+        self.status_lbl.grid(row=2,column=0,columnspan=4,pady=4)
+
+    def _build_strategy(self,parent):
+        parent.configure(fg_color=C_BG)
+        hdr=ctk.CTkFrame(parent,fg_color=C_HEADER,height=30,corner_radius=4)
+        hdr.pack(fill="x",padx=4,pady=(4,0)); hdr.pack_propagate(False)
+        x=4
+        for name,w in COLS:
+            ctk.CTkLabel(hdr,text=name,width=w,anchor="center",
+                font=ctk.CTkFont(size=10,weight="bold"),
+                text_color=C_BLUE).place(x=x,rely=0.5,anchor="w"); x+=w+2
+        act=ctk.CTkFrame(parent,fg_color=C_FRAME,height=36,corner_radius=4)
+        act.pack(fill="x",padx=4,pady=(2,0)); act.pack_propagate(False)
+        ctk.CTkLabel(act,text="Selected row:",text_color=C_GRAY,
+            font=ctk.CTkFont(size=11)).pack(side="left",padx=10)
+        ctk.CTkButton(act,text="Manual Sq.Off",width=130,height=26,
+            fg_color=C_RED,hover_color="#c43a3a",font=ctk.CTkFont(size=11),
+            command=self._manual_sqoff).pack(side="left",padx=6)
+        
+        self.selected_lbl=ctk.CTkLabel(act,text="(click a row)",
+            text_color=C_GRAY,font=ctk.CTkFont(size=11))
+        self.selected_lbl.pack(side="left",padx=10)
+        self.sum_bar=ctk.CTkFrame(parent,fg_color=C_FRAME,height=28,corner_radius=4)
+        self.sum_bar.pack(fill="x",padx=4,pady=(2,0)); self.sum_bar.pack_propagate(False)
+        self.sum_lbl=ctk.CTkLabel(self.sum_bar,text="0 LONG  0 SHORT  Next poll: --",
+            font=ctk.CTkFont(size=11),text_color=C_GRAY)
+        self.sum_lbl.pack(side="left",padx=10)
+        self.scroll=ctk.CTkScrollableFrame(parent,fg_color=C_BG,corner_radius=0)
+        self.scroll.pack(fill="both",expand=True,padx=4,pady=4)
+
+    def _build_log(self,parent):
+        parent.configure(fg_color=C_BG)
+        self.log_box=ctk.CTkTextbox(parent,font=ctk.CTkFont(family="Courier",size=11),
+            fg_color="#0a0a14",text_color="#cccccc")
+        self.log_box.pack(fill="both",expand=True,padx=6,pady=6)
+        ctk.CTkButton(parent,text="Clear Log",width=100,
+            command=lambda:self.log_box.delete("0.0","end")).pack(side="right",padx=8,pady=4)
+
+    def _append_log(self,msg):
+        try: self.log_box.insert("end",str(msg)+"\n"); self.log_box.see("end")
+        except Exception: pass
+
+    def _build_instrument_rows(self):
+        for w in self.scroll.winfo_children(): w.destroy()
+        self._rows.clear(); self._selected_idx=None
+        for idx,st in enumerate(self.instruments):
+            bg=C_ROW_A if idx%2==0 else C_ROW_B
+            row=InstrumentRow(self.scroll,idx+1,st,bg,
+                on_check=lambda s,c:setattr(s,"skip",not c),
+                on_click=self._select_row)
+            self._rows.append(row)
+
+    def _select_row(self,idx):
+        if self._selected_idx is not None and self._selected_idx<len(self._rows):
+            self._rows[self._selected_idx].set_selected(False)
+        self._selected_idx=idx; self._rows[idx].set_selected(True)
+        st=self.instruments[idx]
+        self.selected_lbl.configure(text=f"  {st.config.name}  ({st.position})",text_color="white")
+
+    def _on_start(self):
+        self.start_btn.configure(state="disabled",text="Resolving...")
+        self.status_lbl.configure(text="Resolving instruments...",text_color=C_YELLOW)
+        threading.Thread(target=self._resolve_and_start,daemon=True).start()
+
+    def _on_stop(self):
+        if self.engine: self.engine.stop()
+        self.running=False
+        self.start_btn.configure(state="normal",text="START STRATEGY")
+        self.stop_btn.configure(state="disabled")
+        self.status_lbl.configure(text="Stopped",text_color=C_GRAY)
+        self._append_log("[INFO] Stopped.")
+
+    def _manual_sqoff(self):
+        if self._selected_idx is None or not self.engine: return
+        name=self.instruments[self._selected_idx].config.name
+        threading.Thread(target=self.engine.manual_squareoff,args=(name,),daemon=True).start()
+
+    def _toggle_skip(self):
+        if self._selected_idx is None: return
+        st=self.instruments[self._selected_idx]
+        st.skip=not st.skip
+        self._rows[self._selected_idx]._chk_var.set(not st.skip)
+        self.selected_lbl.configure(
+            text=f"  {st.config.name}  ({'skipped' if st.skip else 'active'})",
+            text_color=C_YELLOW if st.skip else "white")
+
+    def _log_bg(self,msg):
+        self.after(0,lambda m=msg:self._append_log(m))
+
+    def _resolve_and_start(self):
+        try:
+            self._log_bg("[1/4] Fetching token...")
+            c,t=fetch_token_from_generator()
+            self._client_id=c; self._access_token=t
+            self._log_bg(f"      Client: {c}  Token: {t[:20]}...")
+            self._log_bg("[2/4] Loading master CSV...")
+            rows=load_master_csv()
+            self._log_bg(f"      {len(rows):,} rows")
+            self._log_bg("[3/4] Resolving NSE stocks...")
+            nse_ids=resolve_nse_stocks(rows,NSE_STOCKS)
+            instruments=[]
+            nq=self.nse_qty_var.get()
+            for sym in NSE_STOCKS:
+                sid=nse_ids.get(sym)
+                if not sid: continue
+                instruments.append(InstrumentState(
+                    config=InstrumentConfig(name=sym,exchange_segment="NSE_EQ",
+                        security_id=sid,product_type="INTRADAY",lot_multiplier=1),
+                    api_qty=nq))
+            self._log_bg("[4/4] Resolving MCX futures...")
+            for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var)]:
+                m=resolve_mcx_future(rows,sym,allow_pick=False)
+                if not m: self._log_bg(f"      WARNING: {sym} not found"); continue
+                mult=MCX_LOT_MULTIPLIERS[sym]
+                instruments.append(InstrumentState(
+                    config=InstrumentConfig(name=sym,exchange_segment="MCX_COMM",
+                        security_id=m["security_id"],product_type="INTRADAY",
+                        lot_multiplier=mult,trading_symbol=m["trading_symbol"],
+                        expiry=m["expiry"]),
+                    api_qty=lv.get()*mult))
+            self._log_bg(f"      {len(instruments)} instruments ready.")
+            if not instruments:
+                self.after(0,lambda:self._on_start_error("No instruments resolved.")); return
+            self.instruments=instruments
+            self.after(0,self._on_resolved)
+        except Exception as e:
+            self.after(0,lambda err=str(e):self._on_start_error(err))
+
+    def _on_resolved(self):
+        self._build_instrument_rows()
+        paper=self.paper_var.get()
+        self.engine=StrategyEngine(
+            client_id=self._client_id,access_token=self._access_token,
+            instruments=self.instruments,interval=self.interval_var.get(),
+            nse_sq_time=self.nse_sq_var.get(),mcx_sq_time=self.mcx_sq_var.get(),
+            paper_mode=paper)
+        self.engine.start(); self.running=True
+        self.tabs.set("Live Strategy")   # ← auto switch to strategy tab
+        self.mode_lbl.configure(text="PAPER" if paper else "LIVE",
+            text_color=C_YELLOW if paper else C_RED)
+        self.start_btn.configure(state="disabled",text="RUNNING")
+        self.stop_btn.configure(state="normal")
+        self.status_lbl.configure(
+            text=f"Running | TF={self.interval_var.get()}min | "
+                 f"{len(self.instruments)} instruments | {'PAPER' if paper else 'LIVE'}",
+            text_color=C_GREEN)
+
+    def _on_start_error(self,err):
+        self._append_log(f"[ERROR] {err}")
+        self.start_btn.configure(state="normal",text="START STRATEGY")
+        self.status_lbl.configure(text=f"Error: {err[:80]}",text_color=C_RED)
+
+    def _gui_tick(self):
+        try:
+            self.clock_lbl.configure(text=datetime.now().strftime("  %H:%M:%S  %d %b %Y"))
+            if self.running and self.engine:
+                logs=self.engine.get_logs(30)
+                with self.engine.lock: self.engine._log_lines.clear()
+                for line in logs: self._append_log(line)
+                total_pnl=sum(s.unrealized_pnl for s in self.instruments)
+                self.pnl_lbl.configure(
+                    text=f"Net P&L:  Rs {total_pnl:+.2f}",
+                    text_color=C_GREEN if total_pnl>=0 else C_RED)
+                ws_st=self.engine.ws_status
+                if "subscribed" in ws_st.lower() or "connected" in ws_st.lower():
+                    self.ws_lbl.configure(text=f"WS OK  {self.engine.ws_ticks} ticks",text_color=C_GREEN)
+                elif "error" in ws_st.lower() or "closed" in ws_st.lower():
+                    self.ws_lbl.configure(text=f"WS ERR",text_color=C_RED)
+                else:
+                    self.ws_lbl.configure(text="WS connecting...",text_color=C_YELLOW)
+                longs=sum(1 for s in self.instruments if s.position=="LONG")
+                shorts=sum(1 for s in self.instruments if s.position=="SHORT")
+                active=sum(1 for s in self.instruments if not s.skip)
+                self.sum_lbl.configure(
+                    text=f"{longs} LONG   {shorts} SHORT   "
+                         f"{active}/{len(self.instruments)} active   "
+                         f"Next poll: {self.engine.next_poll_at}   REST + WS live LTP")
+                nq=self.nse_qty_var.get(); gl=self.gold_lots_var.get(); sl=self.silv_lots_var.get()
+                for row in self._rows: row.update(nq,gl,sl)
+        except Exception: pass
+        finally: self.after(2000,self._gui_tick)
+
 
 def main():
-    app = HATradingApp()
+    app=HATradingApp()
     app.mainloop()
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

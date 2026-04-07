@@ -63,7 +63,7 @@ def bold(s):   return s
 # ─────────────────────────────────────────────────────────────────────────────
 #  DHAN WS CLIENT  (inlined from dhan_ws_client.py — no external file needed)
 # ─────────────────────────────────────────────────────────────────────────────
-from __future__ import annotations
+# (from __future__ import annotations removed — inlined)
 
 import json
 import struct

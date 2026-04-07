@@ -293,17 +293,18 @@ def load_master_csv() -> List[Dict[str, str]]:
     content    = b""
     downloaded = 0
 
+    last_milestone = -1
     for chunk in resp.iter_content(chunk_size=131072):
         content    += chunk
         downloaded += len(chunk)
-        mb = downloaded / 1_048_576
         if total:
-            pct = downloaded / total * 100
-            _gui_log(f"    {mb:.1f} MB / {total/1_048_576:.1f} MB  ({pct:.0f}%)")
-        else:
-            _gui_log(f"    {mb:.1f} MB downloaded ...")
+            pct = int(downloaded / total * 100)
+            milestone = (pct // 10) * 10
+            if milestone > last_milestone:
+                last_milestone = milestone
+                mb = downloaded / 1_048_576
+                _gui_log(f"    Downloading... {mb:.1f} MB / {total/1_048_576:.1f} MB  ({milestone}%)")
 
-    _gui_log()   # newline after progress bar
     MASTER_CSV_CACHE.write_bytes(content)
     _gui_log(f"  {green('✓')} Saved to cache → {MASTER_CSV_CACHE}")
 
@@ -1184,19 +1185,14 @@ class HATradingApp(ctk.CTk):
             progress_color=C_YELLOW).pack(padx=22,pady=4,anchor="w")
         ctk.CTkLabel(mf,text="Turn OFF for live orders",text_color=C_RED,
             font=ctk.CTkFont(size=11)).pack(padx=22,pady=4,anchor="w")
-        btn_row=ctk.CTkFrame(parent,fg_color="transparent")
-        btn_row.grid(row=1,column=0,columnspan=4,pady=18)
-        self.start_btn=ctk.CTkButton(btn_row,text="START STRATEGY",
-            width=240,height=50,font=ctk.CTkFont(size=15,weight="bold"),
-            fg_color=C_GREEN,hover_color="#17a844",command=self._on_start)
-        self.start_btn.pack(side="left",padx=14)
-        self.stop_btn=ctk.CTkButton(btn_row,text="STOP",width=140,height=50,
-            font=ctk.CTkFont(size=15,weight="bold"),fg_color=C_RED,
-            hover_color="#c43a3a",command=self._on_stop,state="disabled")
-        self.stop_btn.pack(side="left",padx=14)
-        self.status_lbl=ctk.CTkLabel(parent,text="Not started",
-            text_color=C_GRAY,font=ctk.CTkFont(size=12))
-        self.status_lbl.grid(row=2,column=0,columnspan=4,pady=4)
+        # (START/STOP controls are on the Live Strategy tab only)
+        self.start_btn=ctk.CTkButton(parent,text="",width=1,height=1,
+            fg_color="transparent",hover_color="transparent",
+            command=self._on_start)   # hidden stub
+        self.stop_btn=ctk.CTkButton(parent,text="",width=1,height=1,
+            fg_color="transparent",hover_color="transparent",
+            command=self._on_stop,state="disabled")  # hidden stub
+        self.status_lbl=ctk.CTkLabel(parent,text="")  # hidden stub
 
     def _build_strategy(self,parent):
         parent.configure(fg_color=C_BG)

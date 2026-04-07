@@ -1102,7 +1102,7 @@ def redraw(engine: StrategyEngine, instruments: List[InstrumentState]):
         f"   NSE sq-off: {engine.nse_sq_time}"
         f"   MCX sq-off: {engine.mcx_sq_time}"
         f"   Next poll: {cyan(engine.next_poll_at)}"
-        f"   {grey('REST polling')}"        f"   {yellow("[PAPER]") if engine.paper_mode else red("[LIVE]")}"
+        f"   {grey('REST polling')}   {yellow('[PAPER]') if engine.paper_mode else red('[LIVE]')}"
     )
     if mcx_info:
         print(f"  MCX contracts: {mcx_info}")

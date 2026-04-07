@@ -1432,14 +1432,14 @@ class HATradingApp(ctk.CTk):
             progress_color=C_YELLOW).pack(padx=22,pady=4,anchor="w")
         ctk.CTkLabel(mf,text="Turn OFF for live orders",text_color=C_RED,
             font=ctk.CTkFont(size=11)).pack(padx=22,pady=4,anchor="w")
-        # (START/STOP controls are on the Live Strategy tab only)
+        # START/STOP only on Live Strategy tab — hidden stubs here for reference
         self.start_btn=ctk.CTkButton(parent,text="",width=1,height=1,
-            fg_color="transparent",hover_color="transparent",
-            command=self._on_start)   # hidden stub
+            fg_color=C_BG,hover_color=C_BG,border_width=0,
+            command=self._on_start)
         self.stop_btn=ctk.CTkButton(parent,text="",width=1,height=1,
-            fg_color="transparent",hover_color="transparent",
-            command=self._on_stop,state="disabled")  # hidden stub
-        self.status_lbl=ctk.CTkLabel(parent,text="")  # hidden stub
+            fg_color=C_BG,hover_color=C_BG,border_width=0,
+            command=self._on_stop,state="disabled")
+        self.status_lbl=ctk.CTkLabel(parent,text="")
 
     def _build_strategy(self,parent):
         parent.configure(fg_color=C_BG)

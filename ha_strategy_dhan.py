@@ -1218,6 +1218,22 @@ class HATradingApp(ctk.CTk):
         self.selected_lbl=ctk.CTkLabel(act,text="(click a row)",
             text_color=C_GRAY,font=ctk.CTkFont(size=11))
         self.selected_lbl.pack(side="left",padx=10)
+        # ── Quick start bar (START/STOP directly on strategy tab) ────────────
+        qstart=ctk.CTkFrame(parent,fg_color=C_FRAME,height=42,corner_radius=4)
+        qstart.pack(fill="x",padx=4,pady=(2,0)); qstart.pack_propagate(False)
+        self.tab_start_btn=ctk.CTkButton(qstart,text="START STRATEGY",
+            width=180,height=30,font=ctk.CTkFont(size=12,weight="bold"),
+            fg_color=C_GREEN,hover_color="#17a844",command=self._on_start)
+        self.tab_start_btn.pack(side="left",padx=8,pady=6)
+        self.tab_stop_btn=ctk.CTkButton(qstart,text="STOP",
+            width=90,height=30,font=ctk.CTkFont(size=12,weight="bold"),
+            fg_color=C_RED,hover_color="#c43a3a",
+            command=self._on_stop,state="disabled")
+        self.tab_stop_btn.pack(side="left",padx=4,pady=6)
+        self.tab_status_lbl=ctk.CTkLabel(qstart,text="Not started",
+            font=ctk.CTkFont(size=11),text_color=C_GRAY)
+        self.tab_status_lbl.pack(side="left",padx=12)
+
         self.sum_bar=ctk.CTkFrame(parent,fg_color=C_FRAME,height=28,corner_radius=4)
         self.sum_bar.pack(fill="x",padx=4,pady=(2,0)); self.sum_bar.pack_propagate(False)
         self.sum_lbl=ctk.CTkLabel(self.sum_bar,text="0 LONG  0 SHORT  Next poll: --",
@@ -1257,7 +1273,9 @@ class HATradingApp(ctk.CTk):
 
     def _on_start(self):
         self.start_btn.configure(state="disabled",text="Resolving...")
+        self.tab_start_btn.configure(state="disabled",text="Resolving...")
         self.status_lbl.configure(text="Resolving instruments...",text_color=C_YELLOW)
+        self.tab_status_lbl.configure(text="Resolving instruments...",text_color=C_YELLOW)
         threading.Thread(target=self._resolve_and_start,daemon=True).start()
 
     def _on_stop(self):
@@ -1265,7 +1283,10 @@ class HATradingApp(ctk.CTk):
         self.running=False
         self.start_btn.configure(state="normal",text="START STRATEGY")
         self.stop_btn.configure(state="disabled")
+        self.tab_start_btn.configure(state="normal",text="START STRATEGY")
+        self.tab_stop_btn.configure(state="disabled")
         self.status_lbl.configure(text="Stopped",text_color=C_GRAY)
+        self.tab_status_lbl.configure(text="Stopped",text_color=C_GRAY)
         self._append_log("[INFO] Stopped.")
 
     def _manual_sqoff(self):
@@ -1333,20 +1354,23 @@ class HATradingApp(ctk.CTk):
             nse_sq_time=self.nse_sq_var.get(),mcx_sq_time=self.mcx_sq_var.get(),
             paper_mode=paper)
         self.engine.start(); self.running=True
-        self.tabs.set("Live Strategy")   # ← auto switch to strategy tab
+        self.tabs.set("Live Strategy")
         self.mode_lbl.configure(text="PAPER" if paper else "LIVE",
             text_color=C_YELLOW if paper else C_RED)
+        status_txt=f"Running | TF={self.interval_var.get()}min | {len(self.instruments)} instruments | {'PAPER' if paper else 'LIVE'}"
         self.start_btn.configure(state="disabled",text="RUNNING")
         self.stop_btn.configure(state="normal")
-        self.status_lbl.configure(
-            text=f"Running | TF={self.interval_var.get()}min | "
-                 f"{len(self.instruments)} instruments | {'PAPER' if paper else 'LIVE'}",
-            text_color=C_GREEN)
+        self.tab_start_btn.configure(state="disabled",text="RUNNING")
+        self.tab_stop_btn.configure(state="normal")
+        self.status_lbl.configure(text=status_txt,text_color=C_GREEN)
+        self.tab_status_lbl.configure(text=status_txt,text_color=C_GREEN)
 
     def _on_start_error(self,err):
         self._append_log(f"[ERROR] {err}")
         self.start_btn.configure(state="normal",text="START STRATEGY")
+        self.tab_start_btn.configure(state="normal",text="START STRATEGY")
         self.status_lbl.configure(text=f"Error: {err[:80]}",text_color=C_RED)
+        self.tab_status_lbl.configure(text=f"Error: {err[:60]}",text_color=C_RED)
 
     def _gui_tick(self):
         try:

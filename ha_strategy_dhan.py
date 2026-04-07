@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import sys as _sys
 import os as _os
 if getattr(_sys, "frozen", False):
-    # Running as PyInstaller EXE — add bundle dir to path
     _sys.path.insert(0, _sys._MEIPASS)
 
 #!/usr/bin/env python3
@@ -22,7 +23,6 @@ if getattr(_sys, "frozen", False):
   Stop      : Ctrl + C
 =============================================================================
 """
-from __future__ import annotations
 
 import csv
 import io
@@ -63,7 +63,6 @@ def bold(s):   return s
 # ─────────────────────────────────────────────────────────────────────────────
 #  DHAN WS CLIENT  (inlined from dhan_ws_client.py — no external file needed)
 # ─────────────────────────────────────────────────────────────────────────────
-# (from __future__ import annotations removed — inlined)
 
 import json
 import struct

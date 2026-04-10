@@ -478,7 +478,12 @@ def place_market_order(
     transaction_type: str,
     quantity: int,
     product_type: str,
+    max_retries: int = 3,
 ) -> Dict[str, Any]:
+    """
+    Place market order with retry on 401 (token refresh) and 429 (rate limit).
+    Retries up to max_retries times with exponential backoff.
+    """
     payload = {
         "dhanClientId":      client_id,
         "transactionType":   transaction_type,
@@ -492,14 +497,45 @@ def place_market_order(
         "disclosedQuantity": 0,
         "afterMarketOrder":  False,
     }
-    resp = requests.post(
-        ORDER_URL,
-        headers=build_headers(client_id, access_token),
-        json=payload,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                ORDER_URL,
+                headers=build_headers(client_id, access_token),
+                json=payload,
+                timeout=15,
+            )
+            # 429 rate limit — wait and retry
+            if resp.status_code == 429:
+                wait = 2 ** attempt   # 2s, 4s, 8s
+                time.sleep(wait)
+                last_exc = Exception(f"429 Rate Limited (attempt {attempt})")
+                continue
+            # 401 unauthorized — try refreshing token from generator
+            if resp.status_code == 401:
+                if attempt < max_retries:
+                    try:
+                        new_c, new_t = fetch_token_from_generator()
+                        access_token = new_t   # use fresh token for retry
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    last_exc = Exception(f"401 Unauthorized (attempt {attempt})")
+                    continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+            continue
+        except Exception as e:
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(1)
+            continue
+    raise last_exc or Exception("Order placement failed after retries")
 
 def fetch_fill_price(client_id: str, access_token: str, order_id: str, fallback: float) -> float:
     try:
@@ -1082,7 +1118,8 @@ class StrategyEngine:
                 self._log(f"ERROR {st.config.name}: {e}")
                 with self.lock:
                     st.status = f"Err: {e}"
-            time.sleep(0.3)
+            # Stagger: longer delay on startup to avoid rate limiting
+            time.sleep(1.5 if startup else 0.5)
 
     def _process(self, st: InstrumentState, startup: bool):
         candles = fetch_ohlc(
@@ -1169,6 +1206,7 @@ class StrategyEngine:
                 self.client_id, self.access_token,
                 st.config.security_id, st.config.exchange_segment,
                 side, st.api_qty, st.config.product_type,
+                max_retries=3,
             )
             order_id = str(resp.get("orderId") or resp.get("order_id") or "")
             self._log(f"[LIVE] ORDER {st.config.name} {side} qty={st.api_qty} → id={order_id}")
@@ -1185,9 +1223,19 @@ class StrategyEngine:
 
         except Exception as e:
             body = getattr(getattr(e, "response", None), "text", "")
-            self._log(f"ORDER ERR {st.config.name} {side}: {e} | body={body[:200]}")
-            with self.lock:
-                st.status = f"OrderErr: {body[:40]}" if body else "OrderErr"
+            status_code = getattr(getattr(e, "response", None), "status_code", 0)
+            if status_code == 401:
+                self._log(f"ORDER ERR {st.config.name}: 401 Unauthorized — regenerate token in Token Generator")
+                with self.lock:
+                    st.status = "401 — Regen token!"
+            elif status_code == 429:
+                self._log(f"ORDER ERR {st.config.name}: 429 Rate Limited — will retry next candle")
+                with self.lock:
+                    st.status = "429 Rate Limit"
+            else:
+                self._log(f"ORDER ERR {st.config.name} {side}: {e} | {body[:150]}")
+                with self.lock:
+                    st.status = f"OrderErr: {body[:35]}" if body else "OrderErr"
 
     def _close_position(self, st: InstrumentState, reason: str = ""):
         if st.position == "FLAT":
@@ -1211,6 +1259,7 @@ class StrategyEngine:
                 self.client_id, self.access_token,
                 st.config.security_id, st.config.exchange_segment,
                 side, st.api_qty, st.config.product_type,
+                max_retries=3,
             )
             order_id = str(resp.get("orderId") or resp.get("order_id") or "")
             self._log(f"[LIVE] CLOSE {st.config.name} {side} ({reason}) → id={order_id}")
@@ -1221,9 +1270,19 @@ class StrategyEngine:
                 st.status      = f"Closed ({reason})"
         except Exception as e:
             body = getattr(getattr(e, "response", None), "text", "")
-            self._log(f"CLOSE ERR {st.config.name}: {e} | body={body[:200]}")
-            with self.lock:
-                st.status = "CloseErr"
+            status_code = getattr(getattr(e, "response", None), "status_code", 0)
+            if status_code == 401:
+                self._log(f"CLOSE ERR {st.config.name}: 401 — regenerate token!")
+                with self.lock:
+                    st.status = "401 — Regen token!"
+            elif status_code == 429:
+                self._log(f"CLOSE ERR {st.config.name}: 429 Rate Limited")
+                with self.lock:
+                    st.status = "429 Rate Limit"
+            else:
+                self._log(f"CLOSE ERR {st.config.name}: {e} | {body[:150]}")
+                with self.lock:
+                    st.status = "CloseErr"
 
     def _reverse_position(self, st: InstrumentState, new_dir: str):
         self._close_position(st, "Reversal")

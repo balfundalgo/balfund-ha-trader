@@ -1890,6 +1890,10 @@ class HATradingApp(ctk.CTk):
         self.nse_sq_var=ctk.StringVar(value="15:15")
         self.mcx_sq_var=ctk.StringVar(value="23:25")
         self.paper_var=ctk.BooleanVar(value=True)
+        self.nifty_opt_var=ctk.BooleanVar(value=False)   # enable NIFTY ATM options
+        self.nifty_lots_var=ctk.IntVar(value=1)           # number of NIFTY lots
+        self.nifty_state: Optional[NiftyOptionsState] = None
+        self._master_rows: List[Dict[str, str]] = []
         self._build_ui(); self.after(2000,self._gui_tick)
         self.after(500, self._preload_instruments)  # load table on startup
 

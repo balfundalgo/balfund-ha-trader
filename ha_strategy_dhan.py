@@ -343,7 +343,7 @@ MCX_SYMBOLS = ["GOLDTEN", "SILVERMICRO"]
 NSE_SESSION_START = "09:15"
 MCX_SESSION_START = "09:00"
 MCX_SESSION_END   = "23:30"
-LOOKBACK_DAYS     = 2
+LOOKBACK_DAYS     = 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
@@ -1128,7 +1128,17 @@ class StrategyEngine:
         )
         if len(candles) < 2:
             with self.lock:
-                st.status = f"Too few bars ({len(candles)})"
+                t = hhmm()
+                if st.config.is_mcx:
+                    in_session = MCX_SESSION_START <= t < MCX_SESSION_END
+                else:
+                    in_session = NSE_SESSION_START <= t < "15:31"
+                if not in_session:
+                    st.status = "Mkt Closed"
+                elif len(candles) == 0:
+                    st.status = "No data from Dhan"
+                else:
+                    st.status = "Waiting for 2nd bar..."
             return
 
         ha        = compute_ha(candles)

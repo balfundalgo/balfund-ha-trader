@@ -346,10 +346,14 @@ MCX_SESSION_END   = "23:30"
 LOOKBACK_DAYS     = 5
 
 # NIFTY options constants
-NIFTY_SPOT_SID    = "13"          # Nifty 50 index security ID on Dhan
-NIFTY_SPOT_SEG    = "IDX_I"       # Index segment
-NIFTY_LOT_SIZE    = 65            # NIFTY lot size fallback (Jan 2026) — auto-read from CSV
-NIFTY_STRIKE_STEP = 50            # NIFTY strike interval
+NIFTY_SPOT_SID        = "13"       # Nifty 50 index security ID on Dhan
+NIFTY_SPOT_SEG        = "IDX_I"    # Index segment
+NIFTY_LOT_SIZE        = 65         # Fallback lot size (Jan 2026) — auto-read from API
+NIFTY_STRIKE_STEP     = 50         # NIFTY strike interval
+
+# Dhan Option Chain API endpoints (used instead of master CSV for lot size + SID)
+OPTIONCHAIN_EXPIRY_URL = "https://api.dhan.co/v2/optionchain/expirylist"
+OPTIONCHAIN_URL        = "https://api.dhan.co/v2/optionchain"
 
 
 def first_candle_close_time(interval: str, is_mcx: bool = False) -> str:
@@ -1056,102 +1060,138 @@ class NiftyOptionsState:
         return (self.opt_ltp - self.entry_price) * (self.lots * self.lot_size)
 
 
-def _parse_lot_size_from_row(row: Dict[str, str]) -> int:
+def fetch_nifty_expiries(client_id: str, access_token: str) -> List[str]:
     """
-    Auto-read lot size from instrument master CSV row.
-    Dhan's CSV uses SEM_LOT_UNITS field.
-    Falls back to NIFTY_LOT_SIZE constant if field missing/invalid.
+    Fetch NIFTY expiry list from Dhan Option Chain API.
+    Returns list of expiry date strings sorted nearest first.
     """
-    # Try known field names used by Dhan in their master CSV
-    for field in ["SEM_LOT_UNITS", "LOT_SIZE", "lot_size", "SEM_QUANTITY_IN_LOT"]:
-        val = row.get(field, "").strip()
-        if val:
-            try:
-                lot = int(float(val))
-                if lot > 0:
-                    return lot
-            except Exception:
-                pass
-    return NIFTY_LOT_SIZE   # fallback to constant
+    payload = {
+        "UnderlyingScrip": "13",
+        "UnderlyingSeg":   "IDX_I",
+    }
+    headers = build_headers(client_id, access_token)
+    resp    = requests.post(OPTIONCHAIN_EXPIRY_URL, headers=headers,
+                            json=payload, timeout=10)
+    resp.raise_for_status()
+    data     = resp.json()
+    expiries = data.get("data", [])
+    today    = datetime.now().date()
+    valid    = []
+    for e in expiries:
+        try:
+            dt = datetime.strptime(e[:10], "%Y-%m-%d").date()
+            if dt >= today:
+                valid.append((dt, e))
+        except Exception:
+            pass
+    valid.sort(key=lambda x: x[0])
+    return [e for _, e in valid]
 
 
-def resolve_nifty_atm_option(
-    rows: List[Dict[str, str]],
-    spot_price: float,
-    option_type: str,   # "CE" or "PE"
+def fetch_nifty_atm_option(
+    client_id:    str,
+    access_token: str,
+    spot_price:   float,
+    option_type:  str,       # "CE" or "PE"
+    expiry:       str,       # expiry string from expiry list
 ) -> Optional[Dict[str, Any]]:
     """
-    Find nearest weekly NIFTY expiry ATM option contract.
-    Auto-reads lot size from the instrument master CSV row.
+    Fetch ATM NIFTY option details from Dhan Option Chain API.
     Returns {security_id, trading_symbol, strike, expiry, lot_size} or None.
+    The API returns lot_size directly — no master CSV needed.
     """
     atm_strike = round(spot_price / NIFTY_STRIKE_STEP) * NIFTY_STRIKE_STEP
-    today      = datetime.now().date()
-    candidates = []
+    payload    = {
+        "UnderlyingScrip": "13",
+        "UnderlyingSeg":   "IDX_I",
+        "Expiry":          expiry,
+    }
+    headers = build_headers(client_id, access_token)
+    resp    = requests.post(OPTIONCHAIN_URL, headers=headers,
+                            json=payload, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
 
-    for row in rows:
-        exch = row.get("SEM_EXM_EXCH_ID", "").strip().upper()
-        seg  = row.get("SEM_SEGMENT",     "").strip().upper()
-        if exch != "NSE" or seg != "D":   # NSE FNO
-            continue
+    # Option chain response has a dict of strike_price → {CE: {...}, PE: {...}}
+    # Try both top-level keys used by Dhan
+    chain = data.get("data") or data.get("optionChain") or data
 
-        sym_name    = row.get("SM_SYMBOL_NAME",     "").strip().upper()
-        trading_sym = row.get("SEM_TRADING_SYMBOL", "").strip().upper()
-        instr       = row.get("SEM_INSTRUMENT_NAME","").strip().upper()
-        sid         = str(row.get("SEM_SMST_SECURITY_ID","")).strip()
+    # Find ATM strike row
+    atm_key  = str(atm_strike)
+    atm_row  = None
+    lot_size = NIFTY_LOT_SIZE   # fallback
 
-        if not sid:
-            continue
-        if "NIFTY" not in sym_name and "NIFTY" not in trading_sym:
-            continue
-        # Exclude BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 etc
-        if any(x in sym_name for x in ["BANK", "FIN", "MIDCP", "NEXT50", "NXT50"]):
-            continue
-        if instr not in ("OPTIDX", "OPTSTK"):
-            continue
-        if not trading_sym.endswith(option_type):
-            continue
-
-        # Parse strike price
-        strike_str = row.get("SEM_STRIKE_PRICE", "").strip()
-        try:
-            strike = int(float(strike_str))
-        except Exception:
-            continue
-        if strike != atm_strike:
-            continue
-
-        # Parse expiry
-        expiry_dt = None
-        for field in ["SEM_EXPIRY_DATE", "ExpiryDate"]:
-            exp_s = row.get(field, "").strip()
-            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
-                try:
-                    expiry_dt = datetime.strptime(exp_s[:10], fmt).date()
+    # Search for the ATM strike (try exact match, then closest)
+    if isinstance(chain, dict):
+        # Direct dict keyed by strike
+        atm_row = chain.get(atm_key) or chain.get(str(int(atm_strike)))
+        if not atm_row:
+            # Find closest strike key
+            try:
+                keys    = [float(k) for k in chain.keys() if k.replace(".","").isdigit()]
+                closest = min(keys, key=lambda k: abs(k - atm_strike))
+                atm_row = chain.get(str(int(closest))) or chain.get(str(closest))
+                atm_strike = int(closest)
+            except Exception:
+                pass
+    elif isinstance(chain, list):
+        # List of strike objects
+        for item in chain:
+            s = item.get("strikePrice") or item.get("strike") or item.get("StrikePrice")
+            try:
+                if int(float(str(s))) == atm_strike:
+                    atm_row = item
                     break
-                except Exception:
-                    pass
-            if expiry_dt:
-                break
+            except Exception:
+                pass
 
-        if expiry_dt and expiry_dt >= today:
-            # Read lot size directly from this row
-            lot_size = _parse_lot_size_from_row(row)
-            candidates.append((expiry_dt, sid, trading_sym, strike, lot_size, row))
-
-    if not candidates:
+    if not atm_row:
         return None
 
-    # Pick nearest expiry
-    candidates.sort(key=lambda x: x[0])
-    expiry, sid, trading_sym, strike, lot_size, row = candidates[0]
+    # Extract lot size from chain response
+    for lot_field in ["lotSize", "lot_size", "LotSize", "marketLot", "MarketLot"]:
+        v = atm_row.get(lot_field)
+        if v:
+            try:
+                lot_size = int(v)
+                break
+            except Exception:
+                pass
+
+    # Extract CE or PE leg
+    opt_leg_key = option_type   # "CE" or "PE"
+    opt_leg     = None
+    if isinstance(atm_row, dict):
+        opt_leg = atm_row.get(opt_leg_key) or atm_row.get(option_type.lower())
+
+    if not opt_leg:
+        # Maybe the row IS the leg (list format)
+        ot = atm_row.get("optionType","").upper()
+        if ot == option_type:
+            opt_leg = atm_row
+
+    if not opt_leg:
+        return None
+
+    # Extract security_id and trading_symbol
+    sid = (opt_leg.get("securityId")   or opt_leg.get("security_id")
+           or opt_leg.get("SecurityId") or "")
+    sym = (opt_leg.get("tradingSymbol") or opt_leg.get("trading_symbol")
+           or opt_leg.get("TradingSymbol") or f"NIFTY{atm_strike}{option_type}")
+    lp  = float(opt_leg.get("lastTradedPrice") or opt_leg.get("ltp") or 0)
+
+    if not sid:
+        return None
+
     return {
-        "security_id":    sid,
-        "trading_symbol": trading_sym,
-        "strike":         strike,
-        "expiry":         str(expiry),
-        "lot_size":       lot_size,   # ← auto-fetched from CSV
+        "security_id":    str(sid),
+        "trading_symbol": str(sym),
+        "strike":         atm_strike,
+        "expiry":         expiry,
+        "lot_size":       lot_size,
+        "ltp":            lp,
     }
+
 
 
 class NiftyOptionsEngine:
@@ -1159,13 +1199,16 @@ class NiftyOptionsEngine:
     Separate engine for NIFTY ATM options trading.
     - Polls NIFTY Spot OHLC → computes HA → generates BUY CE / BUY PE signal
     - On signal change: close existing option position, open new ATM option
+    - Uses Dhan Option Chain API to get ATM contract + lot_size (always correct)
     - Runs inside StrategyEngine._run() loop (called from _poll_all)
     """
 
     def __init__(self, state: NiftyOptionsState, master_rows: List[Dict[str, str]]):
-        self.state        = state
-        self.master_rows  = master_rows
+        self.state         = state
+        self.master_rows   = master_rows   # kept for compatibility, not used for options
         self._startup_done = False
+        self._expiry_cache: List[str] = []   # cached expiry list from API
+        self._expiry_cache_ts: float  = 0.0  # timestamp of last fetch
 
     def process(
         self,
@@ -1261,7 +1304,34 @@ class NiftyOptionsEngine:
                       atm_strike, spot, log_fn, lock):
         st = self.state
         # Resolve ATM contract from master CSV
-        match = resolve_nifty_atm_option(self.master_rows, spot, opt_type)
+        # ── Fetch expiry list (cached for 5 min) ─────────────────────────────
+        now_ts = time.time()
+        if not self._expiry_cache or (now_ts - self._expiry_cache_ts) > 300:
+            try:
+                self._expiry_cache    = fetch_nifty_expiries(client_id, access_token)
+                self._expiry_cache_ts = now_ts
+                log_fn(f"[NIFTY] Expiries fetched: {self._expiry_cache[:3]}")
+            except Exception as e:
+                log_fn(f"[NIFTY] Expiry fetch failed: {e}")
+                with lock:
+                    st.status = "Expiry fetch failed"
+                return
+
+        if not self._expiry_cache:
+            with lock:
+                st.status = "No NIFTY expiries found"
+            return
+
+        nearest_expiry = self._expiry_cache[0]
+
+        # ── Fetch ATM option from Option Chain API ────────────────────────────
+        match = None
+        try:
+            match = fetch_nifty_atm_option(
+                client_id, access_token, spot, opt_type, nearest_expiry)
+        except Exception as e:
+            log_fn(f"[NIFTY] Option chain API failed: {e}")
+
         if not match:
             log_fn(f"[NIFTY] Could not find ATM {opt_type} {atm_strike} — skipping")
             with lock:
@@ -1270,13 +1340,12 @@ class NiftyOptionsEngine:
 
         sid      = match["security_id"]
         sym      = match["trading_symbol"]
-        # Use lot_size auto-read from CSV; fallback to constant
-        lot_size = match.get("lot_size", NIFTY_LOT_SIZE)
+        lot_size = match.get("lot_size", NIFTY_LOT_SIZE)   # from Option Chain API
         qty      = st.lots * lot_size
-        fill     = st.opt_ltp if st.opt_ltp > 0 else 0.0
+        fill     = match.get("ltp", 0.0) or st.opt_ltp or 0.0
 
         log_fn(f"[NIFTY] Entering {opt_type} {sym} qty={qty} "
-               f"(lots={st.lots} × lot_size={lot_size}) strike={atm_strike}")
+               f"(lots={st.lots} × lot_size={lot_size} from API) strike={atm_strike}")
 
         if st.paper_mode:
             with lock:
@@ -1929,6 +1998,10 @@ class HATradingApp(ctk.CTk):
                     api_qty=lv.get() * mult))
             if instruments:
                 self.instruments = instruments
+                # Create placeholder NIFTY state for display
+                if not self.nifty_state:
+                    self.nifty_state = NiftyOptionsState(
+                        lots=self.nifty_lots_var.get(), skip=not self.nifty_opt_var.get())
                 self.after(0, self._build_instrument_rows)
                 self.after(0, lambda: self._append_log(
                     f"[AUTO] {len(instruments)} instruments pre-loaded — ready to START."))
@@ -2075,8 +2148,12 @@ class HATradingApp(ctk.CTk):
                 on_check=lambda s,c:setattr(s,"skip",not c),
                 on_click=self._select_row)
             self._rows.append(row)
-        # Add NIFTY options row if enabled
-        if self.nifty_state:
+        # Always show NIFTY options row (greyed if disabled)
+        if self.nifty_opt_var.get() or self.nifty_state:
+            if not self.nifty_state:
+                # Create placeholder state so row renders
+                self.nifty_state = NiftyOptionsState(
+                    lots=self.nifty_lots_var.get(), skip=True)
             self._build_nifty_row(len(self.instruments)+1)
 
     def _build_nifty_row(self, idx: int):
@@ -2097,17 +2174,18 @@ class HATradingApp(ctk.CTk):
         ctk.CTkLabel(frame, text=str(idx), width=COLS[1][1], anchor="center",
             font=ctk.CTkFont(size=11), text_color=C_GRAY).place(x=x, rely=0.5, anchor="w")
         x += COLS[1][1] + 2
-        # Symbol
-        ctk.CTkLabel(frame, text="NIFTY ATM OPTIONS", width=COLS[2][1], anchor="w",
+        # Symbol — dynamic: shows active contract e.g. "NIFTY24500CE"
+        sym_lbl = ctk.CTkLabel(frame, text="NIFTY ATM OPTIONS", width=COLS[2][1], anchor="w",
             font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=C_YELLOW).place(x=x, rely=0.5, anchor="w")
+            text_color=C_YELLOW)
+        sym_lbl.place(x=x, rely=0.5, anchor="w")
         x += COLS[2][1] + 2
         # Exchange
         ctk.CTkLabel(frame, text="NSE", width=COLS[3][1], anchor="center",
             font=ctk.CTkFont(size=11), text_color=C_BLUE).place(x=x, rely=0.5, anchor="w")
         x += COLS[3][1] + 2
         # Dynamic labels: HA Open, HA Close, Color, Signal, Position, Entry, Qty, LTP, P&L, Bar, Status
-        self._nifty_labels = {}
+        self._nifty_labels = {"sym": sym_lbl}   # sym is dynamic
         dyn_names = ["ha_o","ha_c","color","signal","pos","entry","qty","ltp","pnl","bar","status"]
         for ci, name in enumerate(dyn_names, start=4):
             w = COLS[ci][1] if ci < len(COLS) else 90
@@ -2268,6 +2346,13 @@ class HATradingApp(ctk.CTk):
         lbl = self._nifty_labels
         def L(k, txt, clr="white"):
             if k in lbl: lbl[k].configure(text=str(txt), text_color=clr)
+        # Update symbol to show active contract or base label
+        if nst.position != "FLAT" and nst.opt_symbol:
+            L("sym", nst.opt_symbol, C_GREEN if nst.position=="CE" else C_RED)
+        elif nst.opt_strike:
+            L("sym", f"NIFTY ATM {nst.opt_strike}", C_YELLOW)
+        else:
+            L("sym", "NIFTY ATM OPTIONS", C_YELLOW)
         L("ha_o",  f"{nst.ha_open:.2f}"  if nst.ha_open  else "-")
         L("ha_c",  f"{nst.ha_close:.2f}" if nst.ha_close else "-")
         col_clr = {"GREEN":C_GREEN,"RED":C_RED,"DOJI":C_YELLOW}.get(nst.color, C_GRAY)
@@ -2279,7 +2364,13 @@ class HATradingApp(ctk.CTk):
         L("pos",   nst.position if nst.position!="FLAT" else "FLAT", pos_clr)
         L("entry", f"{nst.entry_price:.2f}" if nst.entry_price else "-")
         L("qty",   str(nst.lots * nst.lot_size) if nst.position!="FLAT" else f"{self.nifty_lots_var.get()}L×{nst.lot_size}", C_GRAY)
-        L("ltp",   f"{nst.opt_ltp:.2f}" if nst.opt_ltp else f"Spot:{nst.spot_ltp:.0f}" if nst.spot_ltp else "-")
+        # LTP column: show option LTP if in position, else show NIFTY spot
+        if nst.position != "FLAT" and nst.opt_ltp:
+            L("ltp", f"Opt:{nst.opt_ltp:.2f}", "white")
+        elif nst.spot_ltp:
+            L("ltp", f"N:{nst.spot_ltp:.0f}", C_BLUE)
+        else:
+            L("ltp", "-", C_GRAY)
         pnl = nst.unrealized_pnl
         L("pnl",   f"Rs{pnl:+.2f}" if nst.position!="FLAT" else "-",
           C_GREEN if pnl>=0 else C_RED)

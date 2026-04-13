@@ -1091,10 +1091,11 @@ class NiftyOptionsState:
 def fetch_nifty_expiries(client_id: str, access_token: str) -> List[str]:
     """
     Fetch NIFTY expiry list from Dhan Option Chain API.
+    Note: UnderlyingScrip must be int per Dhan API spec.
     Returns list of expiry date strings sorted nearest first.
     """
     payload = {
-        "UnderlyingScrip": "13",
+        "UnderlyingScrip": 13,          # int, not string
         "UnderlyingSeg":   "IDX_I",
     }
     headers = build_headers(client_id, access_token)
@@ -1121,16 +1122,17 @@ def fetch_nifty_atm_option(
     access_token: str,
     spot_price:   float,
     option_type:  str,       # "CE" or "PE"
-    expiry:       str,       # expiry string from expiry list
+    expiry:       str,       # expiry string from expiry list e.g. "2026-04-17"
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch ATM NIFTY option details from Dhan Option Chain API.
-    Returns {security_id, trading_symbol, strike, expiry, lot_size} or None.
-    The API returns lot_size directly — no master CSV needed.
+    Fetch ATM NIFTY option from Dhan Option Chain API.
+    API spec: UnderlyingScrip=int, response data.oc keyed by strike float string,
+              each value has "ce" and "pe" sub-objects with security_id, last_price.
+    Lot size is NOT in the response — read from instrument master CSV or fallback.
     """
     atm_strike = round(spot_price / NIFTY_STRIKE_STEP) * NIFTY_STRIKE_STEP
     payload    = {
-        "UnderlyingScrip": "13",
+        "UnderlyingScrip": 13,          # int per Dhan API spec
         "UnderlyingSeg":   "IDX_I",
         "Expiry":          expiry,
     }
@@ -1138,85 +1140,57 @@ def fetch_nifty_atm_option(
     resp    = requests.post(OPTIONCHAIN_URL, headers=headers,
                             json=payload, timeout=10)
     resp.raise_for_status()
-    data = resp.json()
+    data  = resp.json()
 
-    # Option chain response has a dict of strike_price → {CE: {...}, PE: {...}}
-    # Try both top-level keys used by Dhan
-    chain = data.get("data") or data.get("optionChain") or data
+    # Response: {"data": {"last_price": 23850.0, "oc": {"23850.000000": {"ce":{...},"pe":{...}}}}}
+    inner   = data.get("data", {})
+    oc_dict = inner.get("oc", {})   # dict keyed by "23850.000000"
 
-    # Find ATM strike row
-    atm_key  = str(atm_strike)
-    atm_row  = None
-    lot_size = NIFTY_LOT_SIZE   # fallback
-
-    # Search for the ATM strike (try exact match, then closest)
-    if isinstance(chain, dict):
-        # Direct dict keyed by strike
-        atm_row = chain.get(atm_key) or chain.get(str(int(atm_strike)))
-        if not atm_row:
-            # Find closest strike key
-            try:
-                keys    = [float(k) for k in chain.keys() if k.replace(".","").isdigit()]
-                closest = min(keys, key=lambda k: abs(k - atm_strike))
-                atm_row = chain.get(str(int(closest))) or chain.get(str(closest))
-                atm_strike = int(closest)
-            except Exception:
-                pass
-    elif isinstance(chain, list):
-        # List of strike objects
-        for item in chain:
-            s = item.get("strikePrice") or item.get("strike") or item.get("StrikePrice")
-            try:
-                if int(float(str(s))) == atm_strike:
-                    atm_row = item
-                    break
-            except Exception:
-                pass
-
-    if not atm_row:
+    if not oc_dict:
         return None
 
-    # Extract lot size from chain response
-    for lot_field in ["lotSize", "lot_size", "LotSize", "marketLot", "MarketLot"]:
-        v = atm_row.get(lot_field)
-        if v:
-            try:
-                lot_size = int(v)
+    # Find ATM strike key — keys are floats like "23850.000000"
+    atm_row = None
+    for key, val in oc_dict.items():
+        try:
+            if int(float(key)) == atm_strike:
+                atm_row = val
                 break
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-    # Extract CE or PE leg
-    opt_leg_key = option_type   # "CE" or "PE"
-    opt_leg     = None
-    if isinstance(atm_row, dict):
-        opt_leg = atm_row.get(opt_leg_key) or atm_row.get(option_type.lower())
+    # If exact ATM not found, pick closest strike
+    if atm_row is None:
+        try:
+            keys    = [(abs(int(float(k)) - atm_strike), k, v) for k, v in oc_dict.items()]
+            keys.sort(key=lambda x: x[0])
+            _, best_key, atm_row = keys[0]
+            atm_strike = int(float(best_key))
+        except Exception:
+            return None
 
-    if not opt_leg:
-        # Maybe the row IS the leg (list format)
-        ot = atm_row.get("optionType","").upper()
-        if ot == option_type:
-            opt_leg = atm_row
-
+    # Extract CE or PE leg (lowercase keys per API spec)
+    opt_key = option_type.lower()   # "ce" or "pe"
+    opt_leg = atm_row.get(opt_key)
     if not opt_leg:
         return None
 
-    # Extract security_id and trading_symbol
-    sid = (opt_leg.get("securityId")   or opt_leg.get("security_id")
-           or opt_leg.get("SecurityId") or "")
-    sym = (opt_leg.get("tradingSymbol") or opt_leg.get("trading_symbol")
-           or opt_leg.get("TradingSymbol") or f"NIFTY{atm_strike}{option_type}")
-    lp  = float(opt_leg.get("lastTradedPrice") or opt_leg.get("ltp") or 0)
+    # security_id, last_price from leg
+    sid = str(opt_leg.get("security_id", ""))
+    lp  = float(opt_leg.get("last_price", 0) or 0)
+    # Build synthetic trading symbol e.g. NIFTY2341724150CE
+    exp_str = expiry.replace("-", "")[:8]   # "20260417"
+    sym     = f"NIFTY{exp_str}{atm_strike}{option_type}"
 
     if not sid:
         return None
 
     return {
-        "security_id":    str(sid),
-        "trading_symbol": str(sym),
+        "security_id":    sid,
+        "trading_symbol": sym,
         "strike":         atm_strike,
         "expiry":         expiry,
-        "lot_size":       lot_size,
+        "lot_size":       NIFTY_LOT_SIZE,   # 65 — API doesn't return lot size
         "ltp":            lp,
     }
 

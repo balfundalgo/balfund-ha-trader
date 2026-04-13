@@ -984,6 +984,26 @@ class MultiTickerWS:
                 self._ws_client.stop()
             except Exception:
                 pass
+
+    def subscribe_instrument(self, security_id: str, exchange_segment: str):
+        """Dynamically subscribe a new instrument on the live WebSocket connection."""
+        entry = (security_id, exchange_segment)
+        if entry not in self.instruments:
+            self.instruments.append(entry)
+        if self._ws:
+            try:
+                sub = {
+                    "RequestCode":     REQ_SUB_TICKER,
+                    "InstrumentCount": 1,
+                    "InstrumentList":  [
+                        {"ExchangeSegment": exchange_segment, "SecurityId": security_id}
+                    ],
+                }
+                self._ws.send(json.dumps(sub))
+                self._status(f"WS subscribed: {exchange_segment}:{security_id}")
+            except Exception as e:
+                self._status(f"WS subscribe error: {e}")
+
     # ── WebSocket live LTP ────────────────────────────────────
 
     def _start_ws(self):

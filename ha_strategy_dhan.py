@@ -926,7 +926,9 @@ class MultiTickerWS:
             self._last_keys[sid] = key
 
             self.tick_count += 1
-            self._on_tick_cb(sid, ltp)
+            # Pass exchange segment so engine can do segment-qualified routing
+            exch_seg = hdr.get("exch_seg_name", "")
+            self._on_tick_cb(sid, ltp, exch_seg)
 
         except Exception as e:
             self._status(f"WS parse err: {e}")
@@ -970,7 +972,11 @@ class MultiTickerWS:
 
     def _start_ws(self):
         """Start one WebSocket connection subscribing to all instruments + NIFTY spot."""
-        self._sid_map = {st.config.security_id: st for st in self.instruments}
+        # Key by "segment:security_id" to avoid conflicts (e.g. ABB and NIFTY both have sid=13)
+        self._sid_map = {
+            f"{st.config.exchange_segment}:{st.config.security_id}": st
+            for st in self.instruments
+        }
         instr_list    = [
             (st.config.security_id, st.config.exchange_segment)
             for st in self.instruments
@@ -991,10 +997,16 @@ class MultiTickerWS:
         )
         self._ws_client.start()
 
-    def _on_ws_tick(self, security_id: str, ltp: float):
-        """Called on every live tick — update LTP immediately."""
-        # Route to main instrument
-        st = self._sid_map.get(security_id)
+    def _on_ws_tick(self, security_id: str, ltp: float, exch_seg: str = ""):
+        """Called on every live tick — update LTP immediately.
+        Uses segment:security_id key to avoid conflicts (e.g. ABB and NIFTY both sid=13).
+        """
+        # Try segment-qualified key first (most accurate)
+        seg_key = f"{exch_seg}:{security_id}" if exch_seg else ""
+        st = self._sid_map.get(seg_key) if seg_key else None
+        # Fallback to just security_id if segment-key not found
+        if st is None:
+            st = self._sid_map.get(security_id)
         if st:
             with self.lock:
                 st.last_ltp = round(ltp, 2)
@@ -1476,7 +1488,11 @@ class StrategyEngine:
 
     def _start_ws(self):
         """Start one WebSocket connection subscribing to all instruments + NIFTY spot."""
-        self._sid_map = {st.config.security_id: st for st in self.instruments}
+        # Key by "segment:security_id" to avoid conflicts (e.g. ABB and NIFTY both have sid=13)
+        self._sid_map = {
+            f"{st.config.exchange_segment}:{st.config.security_id}": st
+            for st in self.instruments
+        }
         instr_list    = [
             (st.config.security_id, st.config.exchange_segment)
             for st in self.instruments
@@ -1497,10 +1513,16 @@ class StrategyEngine:
         )
         self._ws_client.start()
 
-    def _on_ws_tick(self, security_id: str, ltp: float):
-        """Called on every live tick — update LTP immediately."""
-        # Route to main instrument
-        st = self._sid_map.get(security_id)
+    def _on_ws_tick(self, security_id: str, ltp: float, exch_seg: str = ""):
+        """Called on every live tick — update LTP immediately.
+        Uses segment:security_id key to avoid conflicts (e.g. ABB and NIFTY both sid=13).
+        """
+        # Try segment-qualified key first (most accurate)
+        seg_key = f"{exch_seg}:{security_id}" if exch_seg else ""
+        st = self._sid_map.get(seg_key) if seg_key else None
+        # Fallback to just security_id if segment-key not found
+        if st is None:
+            st = self._sid_map.get(security_id)
         if st:
             with self.lock:
                 st.last_ltp = round(ltp, 2)
@@ -2059,7 +2081,7 @@ class HATradingApp(ctk.CTk):
             text_color=C_YELLOW).pack(side="left")
         ctk.CTkEntry(nr,textvariable=self.nifty_lots_var,width=50,
             font=ctk.CTkFont(size=12)).pack(side="left",padx=8)
-        ctk.CTkLabel(nr,text="lots (75 shares each)",text_color=C_GRAY,
+        ctk.CTkLabel(nr,text="lots (lot size auto-fetched from API)",text_color=C_GRAY,
             font=ctk.CTkFont(size=11)).pack(side="left")
         sf=card(2,"Auto Square-off")
         for l,v in [("NSE (HH:MM):",self.nse_sq_var),("MCX (HH:MM):",self.mcx_sq_var)]:

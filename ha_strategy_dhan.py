@@ -724,21 +724,37 @@ def resolve_mcx_future(
         if not any(v in all_names for v in variants):
             continue
 
-        # ── Parse expiry ──────────────────────────────────────
+        # ── Parse expiry — primary: extract from trading symbol itself ─────
+        # e.g. GOLDTEN-30APR2026-FUT → 30APR2026 → 2026-04-30
         expiry_dt = None
-        for field in expiry_fields:
-            expiry_str = row.get(field, "").strip()
-            if not expiry_str:
-                continue
-            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y",
-                        "%Y/%m/%d", "%d-%b-%Y", "%d %b %Y"):
-                try:
-                    expiry_dt = datetime.strptime(expiry_str[:11], fmt).date()
+
+        # Method 1: Parse from trading symbol (e.g. "30APR2026" in GOLDTEN-30APR2026-FUT)
+        import re as _re
+        sym_match = _re.search(r"(\d{2})([A-Z]{3})(\d{4})", trading_sym)
+        if sym_match:
+            try:
+                expiry_dt = datetime.strptime(
+                    f"{sym_match.group(1)}{sym_match.group(2)}{sym_match.group(3)}",
+                    "%d%b%Y"
+                ).date()
+            except Exception:
+                pass
+
+        # Method 2: Try CSV expiry fields if symbol parse failed
+        if not expiry_dt:
+            for field in expiry_fields:
+                expiry_str = row.get(field, "").strip()
+                if not expiry_str:
+                    continue
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y",
+                            "%Y/%m/%d", "%d-%b-%Y", "%d %b %Y"):
+                    try:
+                        expiry_dt = datetime.strptime(expiry_str[:11], fmt).date()
+                        break
+                    except Exception:
+                        pass
+                if expiry_dt:
                     break
-                except Exception:
-                    pass
-            if expiry_dt:
-                break
 
         found.append((expiry_dt, sid, trading_sym))
 
@@ -1232,7 +1248,10 @@ class NiftyOptionsEngine:
         lock,
     ):
         st = self.state
-        if st.skip or st.sq_off_done:
+        if st.skip:
+            log_fn("[NIFTY] Skipped (checkbox OFF)")
+            return
+        if st.sq_off_done:
             return
 
         # ── Fetch NIFTY Spot OHLC ───────────────────────────────────────────
@@ -2294,6 +2313,18 @@ class HATradingApp(ctk.CTk):
             if not instruments:
                 self.after(0,lambda:self._on_start_error("No instruments resolved.")); return
             self.instruments=instruments
+            self._master_rows=rows  # save for nifty engine
+            # Create NIFTY options state based on checkbox
+            if self.nifty_opt_var.get():
+                self.nifty_state = NiftyOptionsState(
+                    lots=self.nifty_lots_var.get(),
+                    skip=False,
+                    paper_mode=self.paper_var.get())
+                self._log_bg(f"[NIFTY] Options enabled — lots={self.nifty_lots_var.get()}")
+            else:
+                # Keep placeholder for display but mark as skipped
+                if self.nifty_state:
+                    self.nifty_state.skip = True
             self.after(0,self._on_resolved)
         except Exception as e:
             self.after(0,lambda err=str(e):self._on_start_error(err))
@@ -2306,9 +2337,12 @@ class HATradingApp(ctk.CTk):
             instruments=self.instruments,interval=self.interval_var.get(),
             nse_sq_time=self.nse_sq_var.get(),mcx_sq_time=self.mcx_sq_var.get(),
             paper_mode=paper)
-        # Wire NIFTY options engine if enabled
-        if self.nifty_state and self._master_rows:
+        # Wire NIFTY options engine if enabled and not skipped
+        if self.nifty_state and not self.nifty_state.skip and self._master_rows:
             self.engine.set_nifty_engine(self.nifty_state, self._master_rows)
+            self._log_bg("[NIFTY] Options engine wired — will trade ATM CE/PE")
+        elif self.nifty_state and self.nifty_state.skip:
+            self._log_bg("[NIFTY] Options checkbox is OFF — not trading")
         self.engine.start(); self.running=True
         self.tabs.set("Live Strategy")
         self.mode_lbl.configure(text="PAPER" if paper else "LIVE",

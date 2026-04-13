@@ -345,6 +345,40 @@ MCX_SESSION_START = "09:00"
 MCX_SESSION_END   = "23:30"
 LOOKBACK_DAYS     = 5
 
+# NIFTY options constants
+NIFTY_SPOT_SID    = "13"          # Nifty 50 index security ID on Dhan
+NIFTY_SPOT_SEG    = "IDX_I"       # Index segment
+NIFTY_LOT_SIZE    = 65            # NIFTY lot size fallback (Jan 2026) — auto-read from CSV
+NIFTY_STRIKE_STEP = 50            # NIFTY strike interval
+
+
+def first_candle_close_time(interval: str, is_mcx: bool = False) -> str:
+    """
+    Return HH:MM of when the first candle of the session closes.
+    NSE: session starts 09:15, so:
+        1min  → 09:16
+        5min  → 09:20
+        15min → 09:30
+    MCX: session starts 09:00, so:
+        1min  → 09:01
+        5min  → 09:05
+        15min → 09:15
+    """
+    if is_mcx:
+        start_h, start_m = 9, 0
+    else:
+        start_h, start_m = 9, 15
+
+    mins = int(interval)
+    total = start_h * 60 + start_m + mins
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def today_has_first_candle_closed(interval: str, is_mcx: bool = False) -> bool:
+    """Return True if the first candle of today's session has already closed."""
+    close_time = first_candle_close_time(interval, is_mcx)
+    return hhmm() >= close_time
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -924,16 +958,22 @@ class MultiTickerWS:
     def stop(self):
         self._stop.set()
         if self._ws_client:
-            self._ws_client.stop()
+            try:
+                self._ws_client.stop()
+            except Exception:
+                pass
     # ── WebSocket live LTP ────────────────────────────────────
 
     def _start_ws(self):
-        """Start one WebSocket connection subscribing to all instruments."""
+        """Start one WebSocket connection subscribing to all instruments + NIFTY spot."""
         self._sid_map = {st.config.security_id: st for st in self.instruments}
         instr_list    = [
             (st.config.security_id, st.config.exchange_segment)
             for st in self.instruments
         ]
+        # Always subscribe NIFTY spot for live LTP (needed for options P&L)
+        if (NIFTY_SPOT_SID, NIFTY_SPOT_SEG) not in instr_list:
+            instr_list.append((NIFTY_SPOT_SID, NIFTY_SPOT_SEG))
         def _on_status(msg):
             self.ws_status = msg
             self._log(f"[WS] {msg}")
@@ -949,10 +989,17 @@ class MultiTickerWS:
 
     def _on_ws_tick(self, security_id: str, ltp: float):
         """Called on every live tick — update LTP immediately."""
+        # Route to main instrument
         st = self._sid_map.get(security_id)
         if st:
             with self.lock:
                 st.last_ltp = round(ltp, 2)
+            self.ws_ticks += 1
+            return
+        # Route NIFTY spot tick to nifty_state
+        if security_id == NIFTY_SPOT_SID and self.nifty_state:
+            with self.lock:
+                self.nifty_state.spot_ltp = round(ltp, 2)
             self.ws_ticks += 1
 
 
@@ -965,6 +1012,352 @@ class MultiTickerWS:
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NIFTY OPTIONS STATE  (special instrument — HA on Spot, trade ATM options)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class NiftyOptionsState:
+    """Tracks NIFTY ATM options position — HA computed on NIFTY Spot."""
+    enabled:       bool  = True
+    skip:          bool  = False
+    sq_off_done:   bool  = False
+    lots:          int   = 1        # number of lots to trade
+    lot_size:      int   = 65       # auto-fetched from CSV, updated on first entry
+    paper_mode:    bool  = True
+
+    # NIFTY Spot HA data
+    spot_ltp:      float = 0.0
+    ha_open:       float = 0.0
+    ha_close:      float = 0.0
+    color:         str   = "-"
+    bar_time:      str   = ""
+    last_signal:   str   = "-"     # BUY (CE) or SELL (PE)
+
+    # Active option position
+    position:      str   = "FLAT"  # FLAT | CE | PE
+    opt_sid:       str   = ""      # security_id of active option
+    opt_symbol:    str   = ""      # e.g. NIFTY24500CE
+    opt_expiry:    str   = ""
+    opt_strike:    int   = 0
+    entry_price:   float = 0.0
+    entry_time:    str   = ""
+    opt_ltp:       float = 0.0     # updated via WS
+
+    status:        str   = "Waiting..."
+    last_update:   str   = ""
+
+    @property
+    def unrealized_pnl(self) -> float:
+        if self.position == "FLAT" or not self.entry_price or not self.opt_ltp:
+            return 0.0
+        return (self.opt_ltp - self.entry_price) * (self.lots * self.lot_size)
+
+
+def _parse_lot_size_from_row(row: Dict[str, str]) -> int:
+    """
+    Auto-read lot size from instrument master CSV row.
+    Dhan's CSV uses SEM_LOT_UNITS field.
+    Falls back to NIFTY_LOT_SIZE constant if field missing/invalid.
+    """
+    # Try known field names used by Dhan in their master CSV
+    for field in ["SEM_LOT_UNITS", "LOT_SIZE", "lot_size", "SEM_QUANTITY_IN_LOT"]:
+        val = row.get(field, "").strip()
+        if val:
+            try:
+                lot = int(float(val))
+                if lot > 0:
+                    return lot
+            except Exception:
+                pass
+    return NIFTY_LOT_SIZE   # fallback to constant
+
+
+def resolve_nifty_atm_option(
+    rows: List[Dict[str, str]],
+    spot_price: float,
+    option_type: str,   # "CE" or "PE"
+) -> Optional[Dict[str, Any]]:
+    """
+    Find nearest weekly NIFTY expiry ATM option contract.
+    Auto-reads lot size from the instrument master CSV row.
+    Returns {security_id, trading_symbol, strike, expiry, lot_size} or None.
+    """
+    atm_strike = round(spot_price / NIFTY_STRIKE_STEP) * NIFTY_STRIKE_STEP
+    today      = datetime.now().date()
+    candidates = []
+
+    for row in rows:
+        exch = row.get("SEM_EXM_EXCH_ID", "").strip().upper()
+        seg  = row.get("SEM_SEGMENT",     "").strip().upper()
+        if exch != "NSE" or seg != "D":   # NSE FNO
+            continue
+
+        sym_name    = row.get("SM_SYMBOL_NAME",     "").strip().upper()
+        trading_sym = row.get("SEM_TRADING_SYMBOL", "").strip().upper()
+        instr       = row.get("SEM_INSTRUMENT_NAME","").strip().upper()
+        sid         = str(row.get("SEM_SMST_SECURITY_ID","")).strip()
+
+        if not sid:
+            continue
+        if "NIFTY" not in sym_name and "NIFTY" not in trading_sym:
+            continue
+        # Exclude BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 etc
+        if any(x in sym_name for x in ["BANK", "FIN", "MIDCP", "NEXT50", "NXT50"]):
+            continue
+        if instr not in ("OPTIDX", "OPTSTK"):
+            continue
+        if not trading_sym.endswith(option_type):
+            continue
+
+        # Parse strike price
+        strike_str = row.get("SEM_STRIKE_PRICE", "").strip()
+        try:
+            strike = int(float(strike_str))
+        except Exception:
+            continue
+        if strike != atm_strike:
+            continue
+
+        # Parse expiry
+        expiry_dt = None
+        for field in ["SEM_EXPIRY_DATE", "ExpiryDate"]:
+            exp_s = row.get(field, "").strip()
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    expiry_dt = datetime.strptime(exp_s[:10], fmt).date()
+                    break
+                except Exception:
+                    pass
+            if expiry_dt:
+                break
+
+        if expiry_dt and expiry_dt >= today:
+            # Read lot size directly from this row
+            lot_size = _parse_lot_size_from_row(row)
+            candidates.append((expiry_dt, sid, trading_sym, strike, lot_size, row))
+
+    if not candidates:
+        return None
+
+    # Pick nearest expiry
+    candidates.sort(key=lambda x: x[0])
+    expiry, sid, trading_sym, strike, lot_size, row = candidates[0]
+    return {
+        "security_id":    sid,
+        "trading_symbol": trading_sym,
+        "strike":         strike,
+        "expiry":         str(expiry),
+        "lot_size":       lot_size,   # ← auto-fetched from CSV
+    }
+
+
+class NiftyOptionsEngine:
+    """
+    Separate engine for NIFTY ATM options trading.
+    - Polls NIFTY Spot OHLC → computes HA → generates BUY CE / BUY PE signal
+    - On signal change: close existing option position, open new ATM option
+    - Runs inside StrategyEngine._run() loop (called from _poll_all)
+    """
+
+    def __init__(self, state: NiftyOptionsState, master_rows: List[Dict[str, str]]):
+        self.state        = state
+        self.master_rows  = master_rows
+        self._startup_done = False
+
+    def process(
+        self,
+        client_id:    str,
+        access_token: str,
+        interval:     str,
+        startup:      bool,
+        log_fn,        # callable
+        lock,
+    ):
+        st = self.state
+        if st.skip or st.sq_off_done:
+            return
+
+        # ── Fetch NIFTY Spot OHLC ───────────────────────────────────────────
+        try:
+            candles = fetch_ohlc(client_id, access_token,
+                                  NIFTY_SPOT_SID, NIFTY_SPOT_SEG, interval)
+        except Exception as e:
+            with lock:
+                st.status = f"Spot fetch err: {e}"
+            return
+
+        if len(candles) < 2:
+            with lock:
+                st.status = "Waiting for NIFTY data..."
+            return
+
+        # ── Wait for first candle of today (same logic as main instruments) ──
+        if startup and not self._startup_done:
+            first_closed = today_has_first_candle_closed(interval, is_mcx=False)
+            if not first_closed:
+                close_t = first_candle_close_time(interval, is_mcx=False)
+                with lock:
+                    st.status = f"Waiting first candle ({close_t})..."
+                return
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            bar_date  = datetime.fromtimestamp(candles[-1]["bucket"]).strftime("%Y-%m-%d")
+            if bar_date < today_str:
+                with lock:
+                    st.status = "Waiting today's NIFTY candle..."
+                return
+
+        # ── Compute HA ───────────────────────────────────────────────────────
+        ha_candles = compute_ha(candles)
+        last_ha    = ha_candles[-1]
+        color      = ha_color(last_ha)
+        spot       = candles[-1]["close"]
+        bar_ts     = datetime.fromtimestamp(last_ha["bucket"]).strftime("%H:%M")
+
+        with lock:
+            st.spot_ltp   = round(spot, 2)
+            st.ha_open    = round(last_ha["open"],  2)
+            st.ha_close   = round(last_ha["close"], 2)
+            st.color      = color
+            st.bar_time   = bar_ts
+            st.last_update = now_str()
+
+        if color == "DOJI":
+            with lock:
+                st.status = "DOJI — holding"
+            return
+
+        # BUY CE on green, BUY PE on red
+        signal     = "BUY" if color == "GREEN" else "SELL"
+        opt_type   = "CE" if color == "GREEN" else "PE"
+        atm_strike = round(spot / NIFTY_STRIKE_STEP) * NIFTY_STRIKE_STEP
+
+        with lock:
+            st.last_signal = signal
+
+        # Startup entry
+        if startup and not self._startup_done:
+            self._startup_done = True
+            log_fn(f"[NIFTY] STARTUP → {opt_type} ATM {atm_strike} (HA={color})")
+            self._enter_option(client_id, access_token, opt_type,
+                               atm_strike, spot, log_fn, lock)
+            return
+        if startup:
+            return
+
+        # Running: act only on color change
+        current_pos = st.position
+        if (color == "GREEN" and current_pos != "CE") or            (color == "RED"   and current_pos != "PE"):
+            log_fn(f"[NIFTY] HA turned {color} at {bar_ts} → {opt_type} ATM {atm_strike}")
+            if current_pos != "FLAT":
+                self._exit_option(client_id, access_token, "Reversal", log_fn, lock)
+                time.sleep(0.5)
+            self._enter_option(client_id, access_token, opt_type,
+                               atm_strike, spot, log_fn, lock)
+
+    def _enter_option(self, client_id, access_token, opt_type,
+                      atm_strike, spot, log_fn, lock):
+        st = self.state
+        # Resolve ATM contract from master CSV
+        match = resolve_nifty_atm_option(self.master_rows, spot, opt_type)
+        if not match:
+            log_fn(f"[NIFTY] Could not find ATM {opt_type} {atm_strike} — skipping")
+            with lock:
+                st.status = f"No contract: ATM {atm_strike} {opt_type}"
+            return
+
+        sid      = match["security_id"]
+        sym      = match["trading_symbol"]
+        # Use lot_size auto-read from CSV; fallback to constant
+        lot_size = match.get("lot_size", NIFTY_LOT_SIZE)
+        qty      = st.lots * lot_size
+        fill     = st.opt_ltp if st.opt_ltp > 0 else 0.0
+
+        log_fn(f"[NIFTY] Entering {opt_type} {sym} qty={qty} "
+               f"(lots={st.lots} × lot_size={lot_size}) strike={atm_strike}")
+
+        if st.paper_mode:
+            with lock:
+                st.position    = opt_type
+                st.opt_sid     = sid
+                st.opt_symbol  = sym
+                st.opt_strike  = atm_strike
+                st.opt_expiry  = match["expiry"]
+                st.lot_size    = lot_size   # update from CSV
+                st.entry_price = fill
+                st.entry_time  = now_str()
+                st.status      = f"[P] {opt_type} {sym} lot={lot_size}"
+            return
+
+        try:
+            resp     = place_market_order(
+                client_id, access_token,
+                sid, "NSE_FNO", "BUY", qty, "INTRADAY", max_retries=3,
+            )
+            order_id = str(resp.get("orderId") or resp.get("order_id") or "")
+            log_fn(f"[NIFTY] ORDER {sym} BUY qty={qty} → id={order_id}")
+            if order_id:
+                time.sleep(1.5)
+                fill = fetch_fill_price(client_id, access_token, order_id, 0.0)
+            with lock:
+                st.position    = opt_type
+                st.opt_sid     = sid
+                st.opt_symbol  = sym
+                st.opt_strike  = atm_strike
+                st.opt_expiry  = match["expiry"]
+                st.lot_size    = lot_size   # update from CSV
+                st.entry_price = fill
+                st.entry_time  = now_str()
+                st.status      = f"Entered {opt_type} {sym} @{fill:.2f} lot={lot_size}"
+        except Exception as e:
+            body = getattr(getattr(e, "response", None), "text", "")
+            log_fn(f"[NIFTY] ORDER ERR: {e} | {body[:150]}")
+            with lock:
+                st.status = f"OrderErr: {str(e)[:40]}"
+
+    def _exit_option(self, client_id, access_token, reason, log_fn, lock):
+        st = self.state
+        if st.position == "FLAT":
+            return
+        qty = st.lots * NIFTY_LOT_SIZE
+        log_fn(f"[NIFTY] Closing {st.opt_symbol} ({reason})")
+
+        if st.paper_mode:
+            pnl = st.unrealized_pnl
+            log_fn(f"[NIFTY] [PAPER] CLOSE {st.opt_symbol}  P&L=₹{pnl:+.2f}")
+            with lock:
+                st.position    = "FLAT"
+                st.opt_sid     = ""
+                st.opt_symbol  = ""
+                st.entry_price = 0.0
+                st.status      = f"[P] Closed ({reason})"
+            return
+
+        try:
+            resp     = place_market_order(
+                client_id, access_token,
+                st.opt_sid, "NSE_FNO", "SELL", qty, "INTRADAY", max_retries=3,
+            )
+            order_id = str(resp.get("orderId") or resp.get("order_id") or "")
+            log_fn(f"[NIFTY] CLOSE {st.opt_symbol} SELL qty={qty} → id={order_id}")
+            with lock:
+                st.position    = "FLAT"
+                st.opt_sid     = ""
+                st.opt_symbol  = ""
+                st.entry_price = 0.0
+                st.status      = f"Closed ({reason})"
+        except Exception as e:
+            body = getattr(getattr(e, "response", None), "text", "")
+            log_fn(f"[NIFTY] CLOSE ERR: {e} | {body[:150]}")
+            with lock:
+                st.status = f"CloseErr"
+
+    def manual_squareoff(self, client_id, access_token, log_fn, lock):
+        self._exit_option(client_id, access_token, "Manual", log_fn, lock)
+        with lock:
+            self.state.sq_off_done = True
 
 class StrategyEngine:
 
@@ -994,6 +1387,9 @@ class StrategyEngine:
         self.ws_ticks:    int = 0
         self._sid_map:    Dict[str, InstrumentState] = {}
         self._ws_client: Optional[MultiTickerWS] = None
+        # NIFTY options — set after init via set_nifty_engine()
+        self.nifty_state:  Optional[NiftyOptionsState]  = None
+        self.nifty_engine: Optional[NiftyOptionsEngine] = None
 
     def start(self):
         self._stop.clear()
@@ -1003,16 +1399,22 @@ class StrategyEngine:
     def stop(self):
         self._stop.set()
         if self._ws_client:
-            self._ws_client.stop()
+            try:
+                self._ws_client.stop()
+            except Exception:
+                pass
     # ── WebSocket live LTP ────────────────────────────────────
 
     def _start_ws(self):
-        """Start one WebSocket connection subscribing to all instruments."""
+        """Start one WebSocket connection subscribing to all instruments + NIFTY spot."""
         self._sid_map = {st.config.security_id: st for st in self.instruments}
         instr_list    = [
             (st.config.security_id, st.config.exchange_segment)
             for st in self.instruments
         ]
+        # Always subscribe NIFTY spot for live LTP (needed for options P&L)
+        if (NIFTY_SPOT_SID, NIFTY_SPOT_SEG) not in instr_list:
+            instr_list.append((NIFTY_SPOT_SID, NIFTY_SPOT_SEG))
         def _on_status(msg):
             self.ws_status = msg
             self._log(f"[WS] {msg}")
@@ -1028,10 +1430,17 @@ class StrategyEngine:
 
     def _on_ws_tick(self, security_id: str, ltp: float):
         """Called on every live tick — update LTP immediately."""
+        # Route to main instrument
         st = self._sid_map.get(security_id)
         if st:
             with self.lock:
                 st.last_ltp = round(ltp, 2)
+            self.ws_ticks += 1
+            return
+        # Route NIFTY spot tick to nifty_state
+        if security_id == NIFTY_SPOT_SID and self.nifty_state:
+            with self.lock:
+                self.nifty_state.spot_ltp = round(ltp, 2)
             self.ws_ticks += 1
 
 
@@ -1048,6 +1457,15 @@ class StrategyEngine:
     def get_logs(self, n: int = 15) -> List[str]:
         with self.lock:
             return list(self._log_lines[-n:])
+
+    def set_nifty_engine(self, state: NiftyOptionsState, master_rows: List[Dict[str, str]]):
+        """Attach NIFTY options engine to this strategy engine."""
+        self.nifty_state  = state
+        self.nifty_engine = NiftyOptionsEngine(state, master_rows)
+        state.paper_mode  = self.paper_mode
+        # Add NIFTY spot to WS subscription
+        if self._ws_client and self._ws_client._stop.is_set() is False:
+            pass  # WS already running — NIFTY spot will be subscribed on next start
 
     # ── Main loop ─────────────────────────────────────────────
 
@@ -1121,6 +1539,18 @@ class StrategyEngine:
             # Stagger: longer delay on startup to avoid rate limiting
             time.sleep(1.5 if startup else 0.5)
 
+        # ── NIFTY options poll ────────────────────────────────────────────────
+        if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
+            try:
+                self.nifty_engine.process(
+                    self.client_id, self.access_token,
+                    self.interval, startup,
+                    log_fn=self._log,
+                    lock=self.lock,
+                )
+            except Exception as e:
+                self._log(f"[NIFTY ENGINE ERROR] {e}")
+
     def _process(self, st: InstrumentState, startup: bool):
         candles = fetch_ohlc(
             self.client_id, self.access_token,
@@ -1166,10 +1596,26 @@ class StrategyEngine:
 
         key = st.config.name
 
-        # Startup: enter immediately
+        # Startup: wait for first candle of TODAY to close before entering
         if startup and not self._startup_done.get(key):
+            first_closed = today_has_first_candle_closed(self.interval, st.config.is_mcx)
+            if not first_closed:
+                close_t = first_candle_close_time(self.interval, st.config.is_mcx)
+                with self.lock:
+                    st.status = f"Waiting first candle ({close_t})..."
+                # Do NOT mark startup_done — retry on next poll
+                return
+
+            # Check if last candle is from TODAY (not yesterday)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            bar_date  = datetime.fromtimestamp(last_ha["bucket"]).strftime("%Y-%m-%d")
+            if bar_date < today_str:
+                with self.lock:
+                    st.status = "Waiting today's candle..."
+                return
+
             self._startup_done[key] = True
-            self._log(f"STARTUP {key} → {signal} (HA={color})")
+            self._log(f"STARTUP {key} → {signal} (HA={color} bar={bar_ts})")
             if st.position == "FLAT":
                 self._open_position(st, signal)
             elif (signal == "BUY" and st.position != "LONG") or \
@@ -1528,6 +1974,16 @@ class HATradingApp(ctk.CTk):
             ctk.CTkLabel(r,text=l,width=130,anchor="w",font=ctk.CTkFont(size=12)).pack(side="left")
             ctk.CTkEntry(r,textvariable=v,width=70,font=ctk.CTkFont(size=12)).pack(side="left",padx=6)
             ctk.CTkLabel(r,text=u,text_color=C_GRAY,font=ctk.CTkFont(size=11)).pack(side="left")
+        # NIFTY options row
+        ctk.CTkFrame(qf,fg_color="#333333",height=1).pack(fill="x",padx=16,pady=4)
+        nr=ctk.CTkFrame(qf,fg_color="transparent"); nr.pack(fill="x",padx=16,pady=4)
+        ctk.CTkCheckBox(nr,text="NIFTY ATM Options",variable=self.nifty_opt_var,
+            font=ctk.CTkFont(size=12,weight="bold"),
+            text_color=C_YELLOW).pack(side="left")
+        ctk.CTkEntry(nr,textvariable=self.nifty_lots_var,width=50,
+            font=ctk.CTkFont(size=12)).pack(side="left",padx=8)
+        ctk.CTkLabel(nr,text="lots (75 shares each)",text_color=C_GRAY,
+            font=ctk.CTkFont(size=11)).pack(side="left")
         sf=card(2,"Auto Square-off")
         for l,v in [("NSE (HH:MM):",self.nse_sq_var),("MCX (HH:MM):",self.mcx_sq_var)]:
             r=ctk.CTkFrame(sf,fg_color="transparent"); r.pack(fill="x",padx=16,pady=8)
@@ -1615,6 +2071,47 @@ class HATradingApp(ctk.CTk):
                 on_check=lambda s,c:setattr(s,"skip",not c),
                 on_click=self._select_row)
             self._rows.append(row)
+        # Add NIFTY options row if enabled
+        if self.nifty_state:
+            self._build_nifty_row(len(self.instruments)+1)
+
+    def _build_nifty_row(self, idx: int):
+        """Special row for NIFTY ATM options."""
+        bg = C_ROW_A if idx % 2 == 0 else C_ROW_B
+        nst = self.nifty_state
+        frame = ctk.CTkFrame(self.scroll, fg_color=bg, height=30, corner_radius=3)
+        frame.pack(fill="x", padx=2, pady=1)
+        frame.pack_propagate(False)
+        x = 4
+        # Checkbox
+        chk_var = ctk.BooleanVar(value=not nst.skip)
+        cb = ctk.CTkCheckBox(frame, text="", variable=chk_var,
+            width=COLS[0][1], checkbox_width=16, checkbox_height=16,
+            command=lambda: setattr(nst, "skip", not chk_var.get()))
+        cb.place(x=x, rely=0.5, anchor="w"); x += COLS[0][1] + 2
+        # Index
+        ctk.CTkLabel(frame, text=str(idx), width=COLS[1][1], anchor="center",
+            font=ctk.CTkFont(size=11), text_color=C_GRAY).place(x=x, rely=0.5, anchor="w")
+        x += COLS[1][1] + 2
+        # Symbol
+        ctk.CTkLabel(frame, text="NIFTY ATM OPTIONS", width=COLS[2][1], anchor="w",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=C_YELLOW).place(x=x, rely=0.5, anchor="w")
+        x += COLS[2][1] + 2
+        # Exchange
+        ctk.CTkLabel(frame, text="NSE", width=COLS[3][1], anchor="center",
+            font=ctk.CTkFont(size=11), text_color=C_BLUE).place(x=x, rely=0.5, anchor="w")
+        x += COLS[3][1] + 2
+        # Dynamic labels: HA Open, HA Close, Color, Signal, Position, Entry, Qty, LTP, P&L, Bar, Status
+        self._nifty_labels = {}
+        dyn_names = ["ha_o","ha_c","color","signal","pos","entry","qty","ltp","pnl","bar","status"]
+        for ci, name in enumerate(dyn_names, start=4):
+            w = COLS[ci][1] if ci < len(COLS) else 90
+            lbl = ctk.CTkLabel(frame, text="-", width=w, anchor="center",
+                font=ctk.CTkFont(size=11), text_color=C_GRAY)
+            lbl.place(x=x, rely=0.5, anchor="w")
+            self._nifty_labels[name] = lbl
+            x += w + 2
 
     def _select_row(self,idx):
         if self._selected_idx is not None and self._selected_idx<len(self._rows):
@@ -1705,6 +2202,9 @@ class HATradingApp(ctk.CTk):
             instruments=self.instruments,interval=self.interval_var.get(),
             nse_sq_time=self.nse_sq_var.get(),mcx_sq_time=self.mcx_sq_var.get(),
             paper_mode=paper)
+        # Wire NIFTY options engine if enabled
+        if self.nifty_state and self._master_rows:
+            self.engine.set_nifty_engine(self.nifty_state, self._master_rows)
         self.engine.start(); self.running=True
         self.tabs.set("Live Strategy")
         self.mode_lbl.configure(text="PAPER" if paper else "LIVE",
@@ -1751,9 +2251,38 @@ class HATradingApp(ctk.CTk):
                          f"Next poll: {self.engine.next_poll_at}   REST + WS live LTP")
                 nq=self.nse_qty_var.get(); gl=self.gold_lots_var.get(); sl=self.silv_lots_var.get()
                 for row in self._rows: row.update(nq,gl,sl)
+                # Update NIFTY row
+                if self.nifty_state and hasattr(self, "_nifty_labels"):
+                    self._update_nifty_row()
         except Exception: pass
         finally: self.after(2000,self._gui_tick)
 
+
+
+    def _update_nifty_row(self):
+        nst = self.nifty_state
+        lbl = self._nifty_labels
+        def L(k, txt, clr="white"):
+            if k in lbl: lbl[k].configure(text=str(txt), text_color=clr)
+        L("ha_o",  f"{nst.ha_open:.2f}"  if nst.ha_open  else "-")
+        L("ha_c",  f"{nst.ha_close:.2f}" if nst.ha_close else "-")
+        col_clr = {"GREEN":C_GREEN,"RED":C_RED,"DOJI":C_YELLOW}.get(nst.color, C_GRAY)
+        L("color", nst.color if nst.color != "-" else "-", col_clr)
+        sig_txt = "BUY CE" if nst.last_signal=="BUY" else ("BUY PE" if nst.last_signal=="SELL" else "-")
+        sig_clr = C_GREEN if nst.last_signal=="BUY" else (C_RED if nst.last_signal=="SELL" else C_GRAY)
+        L("signal", sig_txt, sig_clr)
+        pos_clr = C_GREEN if nst.position=="CE" else (C_RED if nst.position=="PE" else C_GRAY)
+        L("pos",   nst.position if nst.position!="FLAT" else "FLAT", pos_clr)
+        L("entry", f"{nst.entry_price:.2f}" if nst.entry_price else "-")
+        L("qty",   str(nst.lots * nst.lot_size) if nst.position!="FLAT" else f"{self.nifty_lots_var.get()}L×{nst.lot_size}", C_GRAY)
+        L("ltp",   f"{nst.opt_ltp:.2f}" if nst.opt_ltp else f"Spot:{nst.spot_ltp:.0f}" if nst.spot_ltp else "-")
+        pnl = nst.unrealized_pnl
+        L("pnl",   f"Rs{pnl:+.2f}" if nst.position!="FLAT" else "-",
+          C_GREEN if pnl>=0 else C_RED)
+        L("bar",   nst.bar_time or "-", C_GRAY)
+        sc = (C_RED if "Err" in nst.status else C_GREEN if "CE" in nst.position
+              else C_RED if "PE" in nst.position else C_GRAY)
+        L("status", nst.status[:35], sc)
 
 def main():
     try:

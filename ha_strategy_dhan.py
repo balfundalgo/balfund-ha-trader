@@ -1013,6 +1013,14 @@ class MultiTickerWS:
         )
         self._ws_client.start()
 
+    def subscribe_nifty_option(self, security_id: str):
+        """Subscribe a NIFTY option security_id to live WS feed for LTP updates."""
+        if self._ws_client and security_id:
+            self._ws_client.subscribe_instrument(security_id, "NSE_FNO")
+            # Also add to sid_map so ticks route to nifty_state.opt_ltp
+            self._nifty_opt_sid = security_id
+            self._log(f"[WS] Subscribed NIFTY option: NSE_FNO:{security_id}")
+
     def _on_ws_tick(self, security_id: str, ltp: float, exch_seg: str = ""):
         """Called on every live tick — update LTP immediately.
         Uses segment:security_id key to avoid conflicts (e.g. ABB and NIFTY both sid=13).
@@ -1028,10 +1036,17 @@ class MultiTickerWS:
                 st.last_ltp = round(ltp, 2)
             self.ws_ticks += 1
             return
-        # Route NIFTY spot tick to nifty_state
+        # Route NIFTY spot tick to nifty_state.spot_ltp
         if security_id == NIFTY_SPOT_SID and self.nifty_state:
             with self.lock:
                 self.nifty_state.spot_ltp = round(ltp, 2)
+            self.ws_ticks += 1
+            return
+        # Route NIFTY option tick to nifty_state.opt_ltp
+        opt_sid = getattr(self, "_nifty_opt_sid", "")
+        if opt_sid and security_id == opt_sid and self.nifty_state:
+            with self.lock:
+                self.nifty_state.opt_ltp = round(ltp, 2)
             self.ws_ticks += 1
 
 
@@ -1207,10 +1222,11 @@ class NiftyOptionsEngine:
 
     def __init__(self, state: NiftyOptionsState, master_rows: List[Dict[str, str]]):
         self.state         = state
-        self.master_rows   = master_rows   # kept for compatibility, not used for options
+        self.master_rows   = master_rows
         self._startup_done = False
-        self._expiry_cache: List[str] = []   # cached expiry list from API
-        self._expiry_cache_ts: float  = 0.0  # timestamp of last fetch
+        self._expiry_cache: List[str] = []
+        self._expiry_cache_ts: float  = 0.0
+        self._engine_ref   = None   # set by StrategyEngine.set_nifty_engine()
 
     def process(
         self,
@@ -1359,10 +1375,13 @@ class NiftyOptionsEngine:
                 st.opt_symbol  = sym
                 st.opt_strike  = atm_strike
                 st.opt_expiry  = match["expiry"]
-                st.lot_size    = lot_size   # update from CSV
+                st.lot_size    = lot_size
                 st.entry_price = fill
                 st.entry_time  = now_str()
                 st.status      = f"[P] {opt_type} {sym} lot={lot_size}"
+            # Subscribe option to WS for live LTP
+            if self._engine_ref:
+                self._engine_ref.subscribe_nifty_option(sid)
             return
 
         try:
@@ -1381,10 +1400,13 @@ class NiftyOptionsEngine:
                 st.opt_symbol  = sym
                 st.opt_strike  = atm_strike
                 st.opt_expiry  = match["expiry"]
-                st.lot_size    = lot_size   # update from CSV
+                st.lot_size    = lot_size
                 st.entry_price = fill
                 st.entry_time  = now_str()
                 st.status      = f"Entered {opt_type} {sym} @{fill:.2f} lot={lot_size}"
+            # Subscribe option to WS for live LTP
+            if self._engine_ref:
+                self._engine_ref.subscribe_nifty_option(sid)
         except Exception as e:
             body = getattr(getattr(e, "response", None), "text", "")
             log_fn(f"[NIFTY] ORDER ERR: {e} | {body[:150]}")
@@ -1464,6 +1486,7 @@ class StrategyEngine:
         # NIFTY options — set after init via set_nifty_engine()
         self.nifty_state:  Optional[NiftyOptionsState]  = None
         self.nifty_engine: Optional[NiftyOptionsEngine] = None
+        self._nifty_opt_sid: str = ""   # security_id of active option being tracked
 
     def start(self):
         self._stop.clear()
@@ -1506,6 +1529,14 @@ class StrategyEngine:
         )
         self._ws_client.start()
 
+    def subscribe_nifty_option(self, security_id: str):
+        """Subscribe a NIFTY option security_id to live WS feed for LTP updates."""
+        if self._ws_client and security_id:
+            self._ws_client.subscribe_instrument(security_id, "NSE_FNO")
+            # Also add to sid_map so ticks route to nifty_state.opt_ltp
+            self._nifty_opt_sid = security_id
+            self._log(f"[WS] Subscribed NIFTY option: NSE_FNO:{security_id}")
+
     def _on_ws_tick(self, security_id: str, ltp: float, exch_seg: str = ""):
         """Called on every live tick — update LTP immediately.
         Uses segment:security_id key to avoid conflicts (e.g. ABB and NIFTY both sid=13).
@@ -1521,10 +1552,17 @@ class StrategyEngine:
                 st.last_ltp = round(ltp, 2)
             self.ws_ticks += 1
             return
-        # Route NIFTY spot tick to nifty_state
+        # Route NIFTY spot tick to nifty_state.spot_ltp
         if security_id == NIFTY_SPOT_SID and self.nifty_state:
             with self.lock:
                 self.nifty_state.spot_ltp = round(ltp, 2)
+            self.ws_ticks += 1
+            return
+        # Route NIFTY option tick to nifty_state.opt_ltp
+        opt_sid = getattr(self, "_nifty_opt_sid", "")
+        if opt_sid and security_id == opt_sid and self.nifty_state:
+            with self.lock:
+                self.nifty_state.opt_ltp = round(ltp, 2)
             self.ws_ticks += 1
 
 
@@ -1546,6 +1584,7 @@ class StrategyEngine:
         """Attach NIFTY options engine to this strategy engine."""
         self.nifty_state  = state
         self.nifty_engine = NiftyOptionsEngine(state, master_rows)
+        self.nifty_engine._engine_ref = self   # back-reference for WS subscription
         state.paper_mode  = self.paper_mode
         # Add NIFTY spot to WS subscription
         if self._ws_client and self._ws_client._stop.is_set() is False:

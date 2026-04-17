@@ -1256,6 +1256,7 @@ class NiftyOptionsEngine:
         startup:      bool,
         log_fn,        # callable
         lock,
+        cached_spot_candles=None,   # pre-fetched from parallel pool
     ):
         st = self.state
         if st.skip:
@@ -1264,14 +1265,17 @@ class NiftyOptionsEngine:
         if st.sq_off_done:
             return
 
-        # ── Fetch NIFTY Spot OHLC ───────────────────────────────────────────
-        try:
-            candles = fetch_ohlc(client_id, access_token,
-                                  NIFTY_SPOT_SID, NIFTY_SPOT_SEG, interval)
-        except Exception as e:
-            with lock:
-                st.status = f"Spot fetch err: {e}"
-            return
+        # ── Use cached NIFTY Spot OHLC (fetched in parallel with other instruments) ──
+        if cached_spot_candles:
+            candles = cached_spot_candles
+        else:
+            try:
+                candles = fetch_ohlc(client_id, access_token,
+                                      NIFTY_SPOT_SID, NIFTY_SPOT_SEG, interval)
+            except Exception as e:
+                with lock:
+                    st.status = f"Spot fetch err: {e}"
+                return
 
         if len(candles) < 2:
             with lock:
@@ -1677,6 +1681,8 @@ class StrategyEngine:
             st for st in self.instruments
             if not st.skip and not st.sq_off_done and self._in_session(st.config)
         ]
+        # Include a special marker for NIFTY spot if NIFTY engine is active
+        _nifty_candles_cache: List[Dict] = []   # populated during parallel fetch
         # Mark closed-market instruments
         for st in self.instruments:
             if not self._in_session(st.config):
@@ -1745,12 +1751,32 @@ class StrategyEngine:
         GAP = 0.20   # 200ms = 5 req/sec max
 
         def _fetch_gated(st):
-            with _gate:             # Only one thread passes gate at a time
-                __import__("time").sleep(GAP)   # Enforces spacing while holding lock
-            return _fetch_one(st)   # HTTP call runs concurrently outside lock
+            with _gate:
+                __import__("time").sleep(GAP)
+            return _fetch_one(st)
+
+        def _fetch_gated_raw(fn):
+            with _gate:
+                __import__("time").sleep(GAP)
+            return fn()
+
+        # Fetch NIFTY spot OHLC alongside other instruments if engine is active
+        _nifty_spot_candles: list = []
+
+        def _fetch_nifty_spot():
+            try:
+                c = fetch_ohlc(self.client_id, self.access_token,
+                               NIFTY_SPOT_SID, NIFTY_SPOT_SEG, self.interval)
+                _nifty_spot_candles.extend(c)
+            except Exception as e:
+                self._log(f"[NIFTY SPOT FETCH ERR] {e}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(_fetch_gated, st): st for st in active}
+            # Submit NIFTY spot fetch into same pool (uses same rate gate)
+            nifty_fut = None
+            if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done and not self.nifty_state.skip:
+                nifty_fut = pool.submit(_fetch_gated_raw, _fetch_nifty_spot)
             for fut in concurrent.futures.as_completed(futures):
                 if self._stop.is_set():
                     break
@@ -1820,14 +1846,19 @@ class StrategyEngine:
                     arrow = "↑LONG" if st.position == "LONG" else "↓SHORT"
                     st.status = f"Holding {arrow}"
 
-        # ── Step 3: NIFTY options ─────────────────────────────────────────────
+        # ── Step 3: NIFTY options (uses pre-fetched spot candles) ────────────
         if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
             try:
+                # Wait for nifty spot fetch to complete (already in flight)
+                if nifty_fut:
+                    try: nifty_fut.result(timeout=10)
+                    except Exception: pass
                 self.nifty_engine.process(
                     self.client_id, self.access_token,
                     self.interval, startup,
                     log_fn=self._log,
                     lock=self.lock,
+                    cached_spot_candles=_nifty_spot_candles if _nifty_spot_candles else None,
                 )
             except Exception as e:
                 self._log(f"[NIFTY ENGINE ERROR] {e}")

@@ -1737,22 +1737,23 @@ class StrategyEngine:
                     st.status = f"FetchErr: {str(e)[:30]}"
                 return st.config.name, None
 
-        # Semaphore limits concurrent API calls — max 3 at a time with stagger
-        _sem = __import__("threading").Semaphore(3)
-        _fetch_lock = __import__("threading").Lock()
-        _last_req = [0.0]
+        # Per Dhan docs v2.2: NO rate limit on 1min/5min/15min intraday data
+        # But burst-fire still gets 429 — use 5 threads with 50ms stagger between starts
+        # This keeps concurrent connections low while staying fast (~4s for 23 instruments)
+        _stagger_lock = __import__("threading").Lock()
+        _start_times  = [0.0]
 
-        def _fetch_throttled(st):
-            with _sem:
-                with _fetch_lock:
-                    elapsed = __import__("time").time() - _last_req[0]
-                    if elapsed < 0.15:          # 150ms between each request start
-                        __import__("time").sleep(0.15 - elapsed)
-                    _last_req[0] = __import__("time").time()
-                return _fetch_one(st)
+        def _fetch_staggered(st):
+            with _stagger_lock:
+                now = __import__("time").time()
+                elapsed = now - _start_times[0]
+                if elapsed < 0.05:              # 50ms min between thread starts
+                    __import__("time").sleep(0.05 - elapsed)
+                _start_times[0] = __import__("time").time()
+            return _fetch_one(st)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {pool.submit(_fetch_throttled, st): st for st in active}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_fetch_staggered, st): st for st in active}
             for fut in concurrent.futures.as_completed(futures):
                 if self._stop.is_set():
                     break

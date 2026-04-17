@@ -1664,25 +1664,151 @@ class StrategyEngine:
     # ── Poll ──────────────────────────────────────────────────
 
     def _poll_all(self, startup: bool = False):
+        """
+        Optimized poll:
+        - OHLC fetches run in parallel (thread pool) — Dhan allows 20 req/sec for data
+        - Orders fired sequentially with 100ms gap — Dhan allows 10 orders/sec
+        - Total time: ~2-3s for 23 instruments instead of 11.5s sequential
+        """
+        import concurrent.futures
+
+        # ── Step 1: Fetch OHLC for all instruments in parallel ────────────────
+        active = [
+            st for st in self.instruments
+            if not st.skip and not st.sq_off_done and self._in_session(st.config)
+        ]
+        # Mark closed-market instruments
         for st in self.instruments:
-            if self._stop.is_set():
-                break
-            if st.skip or st.sq_off_done:
-                continue
             if not self._in_session(st.config):
                 with self.lock:
                     st.status = "Mkt Closed"
-                continue
-            try:
-                self._process(st, startup)
-            except Exception as e:
-                self._log(f"ERROR {st.config.name}: {e}")
-                with self.lock:
-                    st.status = f"Err: {e}"
-            # Stagger: longer delay on startup to avoid rate limiting
-            time.sleep(1.5 if startup else 0.5)
 
-        # ── NIFTY options poll ────────────────────────────────────────────────
+        if not active:
+            return
+
+        # Fetch OHLC for all active instruments concurrently (max 8 threads)
+        signals: Dict[str, Optional[str]] = {}   # name → "BUY"/"SELL"/None
+
+        def _fetch_one(st: InstrumentState):
+            try:
+                candles = fetch_ohlc(
+                    self.client_id, self.access_token,
+                    st.config.security_id, st.config.exchange_segment, self.interval,
+                )
+                if len(candles) < 2:
+                    with self.lock:
+                        t = hhmm()
+                        if st.config.is_mcx:
+                            in_s = MCX_SESSION_START <= t < MCX_SESSION_END
+                        else:
+                            in_s = NSE_SESSION_START <= t < "15:31"
+                        st.status = ("Mkt Closed" if not in_s
+                                     else "No data from Dhan" if len(candles) == 0
+                                     else "Waiting for 2nd bar...")
+                    return st.config.name, None
+
+                ha      = compute_ha(candles)
+                last_ha = ha[-1]
+                color   = ha_color(last_ha)
+                ltp     = candles[-1]["close"]
+                bar_ts  = datetime.fromtimestamp(last_ha["bucket"]).strftime("%H:%M")
+
+                with self.lock:
+                    st.ha_open    = round(last_ha["open"],  2)
+                    st.ha_close   = round(last_ha["close"], 2)
+                    st.color      = color
+                    st.last_ltp   = round(ltp, 2)
+                    st.bar_time   = bar_ts
+                    st.last_update = now_str()
+
+                if color == "DOJI":
+                    with self.lock:
+                        st.status = "DOJI — holding"
+                    return st.config.name, None
+
+                signal = "BUY" if color == "GREEN" else "SELL"
+                with self.lock:
+                    st.last_signal = signal
+                return st.config.name, signal
+
+            except Exception as e:
+                self._log(f"FETCH ERR {st.config.name}: {e}")
+                with self.lock:
+                    st.status = f"FetchErr: {str(e)[:30]}"
+                return st.config.name, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_one, st): st for st in active}
+            for fut in concurrent.futures.as_completed(futures):
+                if self._stop.is_set():
+                    break
+                try:
+                    name, sig = fut.result()
+                    signals[name] = sig
+                except Exception:
+                    pass
+
+        if self._stop.is_set():
+            return
+
+        # ── Step 2: Fire orders sequentially (100ms gap = safe at 10/sec) ────
+        ORDER_GAP = 0.12   # 120ms between orders → ~8/sec (safe margin under 10/sec)
+
+        for st in active:
+            if self._stop.is_set():
+                break
+            signal = signals.get(st.config.name)
+            if signal is None:
+                continue
+
+            key = st.config.name
+
+            # Startup: wait for first candle then enter
+            if startup and not self._startup_done.get(key):
+                first_closed = today_has_first_candle_closed(self.interval, st.config.is_mcx)
+                if not first_closed:
+                    close_t = first_candle_close_time(self.interval, st.config.is_mcx)
+                    with self.lock:
+                        st.status = f"Waiting first candle ({close_t})..."
+                    continue
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                bar_date  = datetime.fromtimestamp(
+                    int(time.time() // (int(self.interval)*60) * (int(self.interval)*60))
+                ).strftime("%Y-%m-%d")
+                # Use last candle bucket from ha_open (already stored)
+                self._startup_done[key] = True
+                self._log(f"STARTUP {key} → {signal}")
+                if st.position == "FLAT":
+                    self._open_position(st, signal)
+                elif (signal == "BUY" and st.position != "LONG") or                      (signal == "SELL" and st.position != "SHORT"):
+                    self._reverse_position(st, signal)
+                time.sleep(ORDER_GAP)
+                continue
+
+            if startup:
+                continue
+
+            # Running: act on direction change
+            if signal == "BUY" and st.position != "LONG":
+                self._log(f"SIGNAL {key} GREEN → BUY")
+                if st.position == "FLAT":
+                    self._open_position(st, signal)
+                else:
+                    self._reverse_position(st, signal)
+                time.sleep(ORDER_GAP)
+            elif signal == "SELL" and st.position != "SHORT":
+                self._log(f"SIGNAL {key} RED → SELL")
+                if st.position == "FLAT":
+                    self._open_position(st, signal)
+                else:
+                    self._reverse_position(st, signal)
+                time.sleep(ORDER_GAP)
+            else:
+                with self.lock:
+                    arrow = "↑LONG" if st.position == "LONG" else "↓SHORT"
+                    st.status = f"Holding {arrow}"
+
+        # ── Step 3: NIFTY options ─────────────────────────────────────────────
         if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
             try:
                 self.nifty_engine.process(

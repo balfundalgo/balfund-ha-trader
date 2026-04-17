@@ -1737,26 +1737,20 @@ class StrategyEngine:
                     st.status = f"FetchErr: {str(e)[:30]}"
                 return st.config.name, None
 
-        # Global rate limiter: enforces minimum 200ms between ANY request
-        # across ALL threads — prevents burst 429s while allowing parallelism
-        # 200ms gap → max 5 req/sec → matches Dhan's documented limit for data APIs
-        _rate_lock = __import__("threading").Lock()
-        _last_fired = [0.0]
-        MIN_GAP = 0.20   # 200ms between any two OHLC requests
+        # Sequential gate: lock is held during the 200ms sleep
+        # This means threads queue up strictly one-at-a-time for the gate,
+        # then make HTTP calls concurrently (outside the lock).
+        # Result: exactly 200ms between any two request STARTS. Zero bursts.
+        _gate = __import__("threading").Lock()
+        GAP = 0.20   # 200ms = 5 req/sec max
 
-        def _fetch_rate_limited(st):
-            with _rate_lock:
-                now = __import__("time").time()
-                wait = MIN_GAP - (now - _last_fired[0])
-                if wait > 0:
-                    __import__("time").sleep(wait)
-                _last_fired[0] = __import__("time").time()
-            # Release lock before making the actual HTTP call
-            return _fetch_one(st)
+        def _fetch_gated(st):
+            with _gate:             # Only one thread passes gate at a time
+                __import__("time").sleep(GAP)   # Enforces spacing while holding lock
+            return _fetch_one(st)   # HTTP call runs concurrently outside lock
 
-        # 3 threads: while one waits for HTTP response, next can enter rate limiter
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(_fetch_rate_limited, st): st for st in active}
+            futures = {pool.submit(_fetch_gated, st): st for st in active}
             for fut in concurrent.futures.as_completed(futures):
                 if self._stop.is_set():
                     break

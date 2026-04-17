@@ -1659,6 +1659,15 @@ class StrategyEngine:
                 self._close_position(st, "AutoSqOff")
                 with self.lock:
                     st.sq_off_done = True
+        # NIFTY options — sq-off at NSE time
+        if self.nifty_state and not self.nifty_state.sq_off_done:
+            if t >= self.nse_sq_time and self.nifty_state.position != "FLAT":
+                self._log("[NIFTY] AUTO SQ-OFF")
+                if self.nifty_engine:
+                    self.nifty_engine.manual_squareoff(
+                        self.client_id, self.access_token, self._log, self.lock)
+                with self.lock:
+                    self.nifty_state.sq_off_done = True
 
     def _in_session(self, cfg: InstrumentConfig) -> bool:
         t = hhmm()
@@ -2403,9 +2412,11 @@ class HATradingApp(ctk.CTk):
         """Special row for NIFTY ATM options."""
         bg = C_ROW_A if idx % 2 == 0 else C_ROW_B
         nst = self.nifty_state
+        nifty_idx = len(self.instruments)   # index past the normal rows
         frame = ctk.CTkFrame(self.scroll, fg_color=bg, height=30, corner_radius=3)
         frame.pack(fill="x", padx=2, pady=1)
         frame.pack_propagate(False)
+        frame.bind("<Button-1>", lambda e: self._select_row(nifty_idx))
         x = 4
         # Checkbox
         chk_var = ctk.BooleanVar(value=not nst.skip)
@@ -2435,15 +2446,24 @@ class HATradingApp(ctk.CTk):
             lbl = ctk.CTkLabel(frame, text="-", width=w, anchor="center",
                 font=ctk.CTkFont(size=11), text_color=C_GRAY)
             lbl.place(x=x, rely=0.5, anchor="w")
+            lbl.bind("<Button-1>", lambda e, i=nifty_idx: self._select_row(i))
             self._nifty_labels[name] = lbl
             x += w + 2
 
     def _select_row(self,idx):
         if self._selected_idx is not None and self._selected_idx<len(self._rows):
             self._rows[self._selected_idx].set_selected(False)
-        self._selected_idx=idx; self._rows[idx].set_selected(True)
-        st=self.instruments[idx]
-        self.selected_lbl.configure(text=f"  {st.config.name}  ({st.position})",text_color="white")
+        self._selected_idx=idx
+        if idx < len(self._rows):
+            self._rows[idx].set_selected(True)
+        if idx < len(self.instruments):
+            st=self.instruments[idx]
+            self.selected_lbl.configure(text=f"  {st.config.name}  ({st.position})",text_color="white")
+        else:
+            # NIFTY row selected
+            nst=self.nifty_state
+            pos=nst.position if nst else "FLAT"
+            self.selected_lbl.configure(text=f"  NIFTY OPTIONS  ({pos})",text_color="white")
 
     def _on_start(self):
         self.start_btn.configure(state="disabled",text="Resolving...")
@@ -2465,8 +2485,19 @@ class HATradingApp(ctk.CTk):
 
     def _manual_sqoff(self):
         if self._selected_idx is None or not self.engine: return
-        name=self.instruments[self._selected_idx].config.name
-        threading.Thread(target=self.engine.manual_squareoff,args=(name,),daemon=True).start()
+        idx = self._selected_idx
+        if idx >= len(self.instruments):
+            # NIFTY row selected
+            if self.engine.nifty_engine:
+                threading.Thread(
+                    target=self.engine.nifty_engine.manual_squareoff,
+                    args=(self.engine.client_id, self.engine.access_token,
+                          self.engine._log, self.engine.lock),
+                    daemon=True).start()
+        else:
+            name=self.instruments[idx].config.name
+            threading.Thread(target=self.engine.manual_squareoff,
+                args=(name,),daemon=True).start()
 
     def _toggle_skip(self):
         if self._selected_idx is None: return

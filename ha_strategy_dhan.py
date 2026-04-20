@@ -328,7 +328,6 @@ MCX_LOT_MULTIPLIERS: Dict[str, int] = {
     "SILVERMICRO": 1,   # 1 lot = 1000g
     "CRUDEOILM":   1,   # 1 lot = 10 barrels (mini crude)
     "ZINCMINI":    1,   # 1 lot = 1000 kg (mini zinc)
-    "ZINCM":       1,   # alternate name in Dhan CSV
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -765,7 +764,13 @@ def resolve_mcx_future(
                 if expiry_dt:
                     break
 
-        found.append((expiry_dt, sid, trading_sym))
+        # Read lot size from CSV (physical units per lot)
+        lot_units_raw = row.get("SEM_LOT_UNITS", "").strip()
+        try:
+            lot_units = int(float(lot_units_raw)) if lot_units_raw else 1
+        except Exception:
+            lot_units = 1
+        found.append((expiry_dt, sid, trading_sym, lot_units))
 
     if not found:
         _gui_log(f"    NOT FOUND: {prefix}  (tried: {variants})")
@@ -776,27 +781,26 @@ def resolve_mcx_future(
 
     tomorrow = today + timedelta(days=1)
     active  = sorted(
-        [(e, s, t) for e, s, t in found if e and e >= tomorrow],  # skip if expires today
+        [(e, s, t, l) for e, s, t, l in found if e and e >= tomorrow],
         key=lambda x: x[0]
     )
-    # Fallback: if nothing found for tomorrow+, include today's expiry
     if not active:
         active = sorted(
-            [(e, s, t) for e, s, t in found if e and e >= today],
+            [(e, s, t, l) for e, s, t, l in found if e and e >= today],
             key=lambda x: x[0]
         )
-    no_exp  = [(e, s, t) for e, s, t in found if not e]
+    no_exp  = [(e, s, t, l) for e, s, t, l in found if not e]
     ordered = active + no_exp
 
     if not ordered:
-        expired = [(e, s, t) for e, s, t in found if e and e < today]
+        expired = [(e, s, t, l) for e, s, t, l in found if e and e < today]
         _gui_log(f"    Only expired futures for {prefix}:")
-        for e, s, t in expired[:3]:
+        for e, s, t, l in expired[:3]:
             _gui_log(f"      contract={t}  expiry={e}  sid={s}")
         return None
 
     _gui_log(f"    Found {len(ordered)} active future(s) for {bold(prefix)}:")
-    for i, (e, s, t) in enumerate(ordered[:6]):
+    for i, (e, s, t, l) in enumerate(ordered[:6]):
         exp_str = str(e) if e else "unknown"
         marker  = green(f"  [{i+1}]") if i == 0 else grey(f"  [{i+1}]")
         _gui_log(f"    {marker} contract={cyan(t):<38} expiry={exp_str:<12} sid={s}")
@@ -812,11 +816,12 @@ def resolve_mcx_future(
             idx = 0
         chosen = ordered[idx]
 
-    e, sid, trading_sym = chosen
+    e, sid, trading_sym, lot_units = chosen
     expiry_out = str(e) if e else "unknown"
     _gui_log(f"    {green(chr(10003))} {prefix:<15} -> sid={sid}  "
-          f"contract={cyan(trading_sym)}  expiry={expiry_out}")
-    return {"security_id": sid, "trading_symbol": trading_sym, "expiry": expiry_out}
+          f"contract={cyan(trading_sym)}  expiry={expiry_out}  lot_units={lot_units}")
+    return {"security_id": sid, "trading_symbol": trading_sym,
+            "expiry": expiry_out, "lot_units": lot_units}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2554,7 +2559,7 @@ class HATradingApp(ctk.CTk):
                     api_qty=nq))
             self._log_bg("[4/4] Resolving MCX futures...")
             for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var),
-                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var),("ZINCM",self.zinc_lots_var)]:
+                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var)]:
                 m=resolve_mcx_future(rows,sym,allow_pick=False)
                 if not m: self._log_bg(f"      WARNING: {sym} not found"); continue
                 mult=MCX_LOT_MULTIPLIERS.get(sym,1)

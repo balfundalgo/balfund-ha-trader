@@ -1511,6 +1511,10 @@ class StrategyEngine:
         self.nifty_state:  Optional[NiftyOptionsState]  = None
         self.nifty_engine: Optional[NiftyOptionsEngine] = None
         self._nifty_opt_sid: str = ""   # security_id of active option being tracked
+        # Shared rate gate for ALL OHLC fetches across all polls
+        # Dhan Data API: 5 req/sec → 200ms minimum gap enforced here
+        import threading as _th
+        self._ohlc_gate = _th.Lock()
 
     def start(self):
         self._stop.clear()
@@ -1753,20 +1757,19 @@ class StrategyEngine:
                 return st.config.name, None
 
         # Sequential gate: lock is held during the 200ms sleep
-        # This means threads queue up strictly one-at-a-time for the gate,
-        # then make HTTP calls concurrently (outside the lock).
-        # Result: exactly 200ms between any two request STARTS. Zero bursts.
-        _gate = __import__("threading").Lock()
-        GAP = 0.20   # 200ms = 5 req/sec max
+        # Use class-level shared gate — persists across ALL polls.
+        # Dhan Data API: 5 req/sec → 200ms minimum gap between requests.
+        _gate = self._ohlc_gate   # ← shared, never reset
+        GAP = 0.20
 
         def _fetch_gated(st):
             with _gate:
-                __import__("time").sleep(GAP)
+                time.sleep(GAP)
             return _fetch_one(st)
 
         def _fetch_gated_raw(fn):
             with _gate:
-                __import__("time").sleep(GAP)
+                time.sleep(GAP)
             return fn()
 
         # Fetch NIFTY spot OHLC alongside other instruments if engine is active
@@ -2164,7 +2167,7 @@ class InstrumentRow:
     def set_selected(self,sel):
         self.frame.configure(fg_color=C_SEL if sel else self._bg)
 
-    def update(self,nse_qty,gold_lots,silv_lots):
+    def update(self,nse_qty,gold_lots,silv_lots,crude_lots=1,zinc_lots=1):
         st=self.st
         def lbl(ci,txt,clr="white"):
             self._labels[ci].configure(text=str(txt),text_color=clr)
@@ -2179,9 +2182,10 @@ class InstrumentRow:
         lbl(CI_SIG,st.last_signal,{"BUY":C_GREEN,"SELL":C_RED}.get(st.last_signal,C_GRAY))
         lbl(CI_POS,st.position,{"LONG":C_GREEN,"SHORT":C_RED,"FLAT":C_GRAY}.get(st.position,C_GRAY))
         lbl(CI_ENT,f"{st.entry_price:.2f}" if st.entry_price else "-")
+        mcx_lots = {"GOLDTEN":gold_lots,"SILVERMICRO":silv_lots,
+                    "CRUDEOILM":crude_lots,"ZINCMINI":zinc_lots}.get(st.config.name,1)
         qty=(str(st.user_qty) if st.position!="FLAT"
-             else str(gold_lots if st.config.name=="GOLDTEN"
-                      else silv_lots if st.config.is_mcx else nse_qty))
+             else str(mcx_lots if st.config.is_mcx else nse_qty))
         lbl(CI_QTY,qty,C_GRAY)
         lbl(CI_LTP,f"{st.last_ltp:.2f}" if st.last_ltp else "-")
         pnl=st.unrealized_pnl
@@ -2238,7 +2242,8 @@ class HATradingApp(ctk.CTk):
                     config=InstrumentConfig(name=sym, exchange_segment="NSE_EQ",
                         security_id=sid, product_type="INTRADAY", lot_multiplier=1),
                     api_qty=nq))
-            for sym, lv in [("GOLDTEN", self.gold_lots_var), ("SILVERMICRO", self.silv_lots_var)]:
+            for sym, lv in [("GOLDTEN", self.gold_lots_var), ("SILVERMICRO", self.silv_lots_var),
+                             ("CRUDEOILM", self.crude_lots_var), ("ZINCMINI", self.zinc_lots_var)]:
                 m = resolve_mcx_future(rows, sym, allow_pick=False)
                 if not m: continue
                 mult = MCX_LOT_MULTIPLIERS[sym]
@@ -2298,7 +2303,9 @@ class HATradingApp(ctk.CTk):
         qf=card(1,"Quantity per Trade")
         for l,v,u in [("NSE Stocks:",self.nse_qty_var,"shares"),
                       ("GOLDTEN:",self.gold_lots_var,"lots"),
-                      ("SILVERMICRO:",self.silv_lots_var,"lots")]:
+                      ("SILVERMICRO:",self.silv_lots_var,"lots"),
+                      ("CRUDEOILM:",self.crude_lots_var,"lots"),
+                      ("ZINCMINI:",self.zinc_lots_var,"lots")]:
             r=ctk.CTkFrame(qf,fg_color="transparent"); r.pack(fill="x",padx=16,pady=5)
             ctk.CTkLabel(r,text=l,width=130,anchor="w",font=ctk.CTkFont(size=12)).pack(side="left")
             ctk.CTkEntry(r,textvariable=v,width=70,font=ctk.CTkFont(size=12)).pack(side="left",padx=6)
@@ -2532,7 +2539,8 @@ class HATradingApp(ctk.CTk):
                         security_id=sid,product_type="INTRADAY",lot_multiplier=1),
                     api_qty=nq))
             self._log_bg("[4/4] Resolving MCX futures...")
-            for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var)]:
+            for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var),
+                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var)]:
                 m=resolve_mcx_future(rows,sym,allow_pick=False)
                 if not m: self._log_bg(f"      WARNING: {sym} not found"); continue
                 mult=MCX_LOT_MULTIPLIERS[sym]
@@ -2621,7 +2629,7 @@ class HATradingApp(ctk.CTk):
                          f"{active}/{len(self.instruments)} active   "
                          f"Next poll: {self.engine.next_poll_at}   REST + WS live LTP")
                 nq=self.nse_qty_var.get(); gl=self.gold_lots_var.get(); sl=self.silv_lots_var.get()
-                for row in self._rows: row.update(nq,gl,sl)
+                for row in self._rows: row.update(nq,gl,sl,self.crude_lots_var.get(),self.zinc_lots_var.get())
                 # Update NIFTY row
                 if self.nifty_state and hasattr(self, "_nifty_labels"):
                     self._update_nifty_row()

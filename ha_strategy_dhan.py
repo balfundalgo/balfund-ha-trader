@@ -2374,9 +2374,7 @@ class HATradingApp(ctk.CTk):
         act.pack(fill="x",padx=4,pady=(2,0)); act.pack_propagate(False)
         ctk.CTkLabel(act,text="Selected row:",text_color=C_GRAY,
             font=ctk.CTkFont(size=11)).pack(side="left",padx=10)
-        ctk.CTkButton(act,text="Manual Sq.Off",width=130,height=26,
-            fg_color=C_RED,hover_color="#c43a3a",font=ctk.CTkFont(size=11),
-            command=self._manual_sqoff).pack(side="left",padx=6)
+
         
         self.selected_lbl=ctk.CTkLabel(act,text="(click a row)",
             text_color=C_GRAY,font=ctk.CTkFont(size=11))
@@ -2509,21 +2507,7 @@ class HATradingApp(ctk.CTk):
         self.tab_status_lbl.configure(text="Stopped",text_color=C_GRAY)
         self._append_log("[INFO] Stopped.")
 
-    def _manual_sqoff(self):
-        if self._selected_idx is None or not self.engine: return
-        idx = self._selected_idx
-        if idx >= len(self.instruments):
-            # NIFTY row selected
-            if self.engine.nifty_engine:
-                threading.Thread(
-                    target=self.engine.nifty_engine.manual_squareoff,
-                    args=(self.engine.client_id, self.engine.access_token,
-                          self.engine._log, self.engine.lock),
-                    daemon=True).start()
-        else:
-            name=self.instruments[idx].config.name
-            threading.Thread(target=self.engine.manual_squareoff,
-                args=(name,),daemon=True).start()
+
 
     def _toggle_skip(self):
         if self._selected_idx is None: return

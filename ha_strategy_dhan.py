@@ -1703,121 +1703,96 @@ class StrategyEngine:
 
     def _poll_all(self, startup: bool = False):
         """
-        Optimized poll:
-        - OHLC fetches run in parallel (thread pool) — Dhan allows 20 req/sec for data
-        - Orders fired sequentially with 100ms gap — Dhan allows 10 orders/sec
-        - Total time: ~2-3s for 23 instruments instead of 11.5s sequential
+        Sequential poll — MCX → NIFTY spot → NSE stocks.
+        Every 5 requests sleep 1s (Dhan Data API: 5 req/sec limit).
+        Orders fire sequentially with 120ms gap (Dhan Order API: 10/sec).
         """
-        import concurrent.futures
 
         # ── Step 1: Fetch OHLC for all instruments in parallel ────────────────
-        active = [
-            st for st in self.instruments
-            if not st.skip and not st.sq_off_done and self._in_session(st.config)
-        ]
-        # Include a special marker for NIFTY spot if NIFTY engine is active
-        _nifty_candles_cache: List[Dict] = []   # populated during parallel fetch
-        # Mark closed-market instruments
+        # Mark closed instruments
         for st in self.instruments:
             if not self._in_session(st.config):
                 with self.lock:
                     st.status = "Mkt Closed"
 
-        if not active:
+        # Active instruments — MCX first, then NSE (matches display order)
+        active_mcx = [st for st in self.instruments
+                      if not st.skip and not st.sq_off_done
+                      and self._in_session(st.config) and st.config.is_mcx]
+        active_nse = [st for st in self.instruments
+                      if not st.skip and not st.sq_off_done
+                      and self._in_session(st.config) and not st.config.is_mcx]
+        active = active_mcx + active_nse
+
+        if not active and not (self.nifty_engine and self.nifty_state
+                               and not self.nifty_state.skip):
             return
 
-        # Fetch OHLC for all active instruments concurrently (max 8 threads)
-        signals: Dict[str, Optional[str]] = {}   # name → "BUY"/"SELL"/None
-
-        def _fetch_one(st: InstrumentState):
-            try:
-                candles = fetch_ohlc(
-                    self.client_id, self.access_token,
-                    st.config.security_id, st.config.exchange_segment, self.interval,
-                )
-                if len(candles) < 2:
-                    with self.lock:
-                        t = hhmm()
-                        if st.config.is_mcx:
-                            in_s = MCX_SESSION_START <= t < MCX_SESSION_END
-                        else:
-                            in_s = NSE_SESSION_START <= t < "15:31"
-                        st.status = ("Mkt Closed" if not in_s
-                                     else "No data from Dhan" if len(candles) == 0
-                                     else "Waiting for 2nd bar...")
-                    return st.config.name, None
-
-                ha      = compute_ha(candles)
-                last_ha = ha[-1]
-                color   = ha_color(last_ha)
-                ltp     = candles[-1]["close"]
-                bar_ts  = datetime.fromtimestamp(last_ha["bucket"]).strftime("%H:%M")
-
-                with self.lock:
-                    st.ha_open    = round(last_ha["open"],  2)
-                    st.ha_close   = round(last_ha["close"], 2)
-                    st.color      = color
-                    st.last_ltp   = round(ltp, 2)
-                    st.bar_time   = bar_ts
-                    st.last_update = now_str()
-
-                if color == "DOJI":
-                    with self.lock:
-                        st.status = "DOJI — holding"
-                    return st.config.name, None
-
-                signal = "BUY" if color == "GREEN" else "SELL"
-                with self.lock:
-                    st.last_signal = signal
-                return st.config.name, signal
-
-            except Exception as e:
-                self._log(f"FETCH ERR {st.config.name}: {e}")
-                with self.lock:
-                    st.status = f"FetchErr: {str(e)[:30]}"
-                return st.config.name, None
-
-        # Sequential gate: lock is held during the 200ms sleep
-        # Use class-level shared gate — persists across ALL polls.
-        # Dhan Data API: 5 req/sec → 200ms minimum gap between requests.
-        _gate = self._ohlc_gate   # ← shared, never reset
-        GAP = 0.25   # 4 req/sec (Dhan limit: 5/sec, 20% safety margin)
-
-        def _fetch_gated(st):
-            with _gate:
-                time.sleep(GAP)
-            return _fetch_one(st)
-
-        def _fetch_gated_raw(fn):
-            with _gate:
-                time.sleep(GAP)
-            return fn()
-
-        # Fetch NIFTY spot OHLC alongside other instruments if engine is active
+        signals: Dict[str, Optional[str]] = {}
         _nifty_spot_candles: list = []
 
-        def _fetch_nifty_spot():
-            try:
-                c = fetch_ohlc(self.client_id, self.access_token,
-                               NIFTY_SPOT_SID, NIFTY_SPOT_SEG, self.interval)
-                _nifty_spot_candles.extend(c)
-            except Exception as e:
-                self._log(f"[NIFTY SPOT FETCH ERR] {e}")
+        need_nifty = (self.nifty_engine and self.nifty_state
+                      and not self.nifty_state.sq_off_done
+                      and not self.nifty_state.skip)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(_fetch_gated, st): st for st in active}
-            # Submit NIFTY spot fetch into same pool (uses same rate gate)
-            nifty_fut = None
-            if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done and not self.nifty_state.skip:
-                nifty_fut = pool.submit(_fetch_gated_raw, _fetch_nifty_spot)
-            for fut in concurrent.futures.as_completed(futures):
-                if self._stop.is_set():
-                    break
-                try:
-                    name, sig = fut.result()
-                    signals[name] = sig
-                except Exception:
-                    pass
+        # Build fetch list: MCX → NIFTY spot → NSE
+        all_fetch = active_mcx[:]
+        if need_nifty:
+            all_fetch.append(None)   # None = NIFTY spot sentinel
+        all_fetch += active_nse
+
+        # ── Sequential fetch: every 5 requests sleep 1s (Dhan 5 req/sec limit) ──
+        for i, st in enumerate(all_fetch):
+            if self._stop.is_set():
+                break
+            try:
+                if st is None:
+                    c = fetch_ohlc(self.client_id, self.access_token,
+                                   NIFTY_SPOT_SID, NIFTY_SPOT_SEG, self.interval)
+                    _nifty_spot_candles.extend(c)
+                else:
+                    candles = fetch_ohlc(
+                        self.client_id, self.access_token,
+                        st.config.security_id, st.config.exchange_segment, self.interval)
+                    if len(candles) < 2:
+                        with self.lock:
+                            t = hhmm()
+                            in_s = (MCX_SESSION_START <= t < MCX_SESSION_END
+                                    if st.config.is_mcx else NSE_SESSION_START <= t < "15:31")
+                            st.status = ("Mkt Closed" if not in_s
+                                         else "No data from Dhan" if len(candles) == 0
+                                         else "Waiting for 2nd bar...")
+                    else:
+                        ha      = compute_ha(candles)
+                        last_ha = ha[-1]
+                        color   = ha_color(last_ha)
+                        ltp     = candles[-1]["close"]
+                        bar_ts  = datetime.fromtimestamp(last_ha["bucket"]).strftime("%H:%M")
+                        with self.lock:
+                            st.ha_open    = round(last_ha["open"],  2)
+                            st.ha_close   = round(last_ha["close"], 2)
+                            st.color      = color
+                            st.last_ltp   = round(ltp, 2)
+                            st.bar_time   = bar_ts
+                            st.last_update = now_str()
+                        if color == "DOJI":
+                            with self.lock:
+                                st.status = "DOJI — holding"
+                        else:
+                            signal = "BUY" if color == "GREEN" else "SELL"
+                            with self.lock:
+                                st.last_signal = signal
+                            signals[st.config.name] = signal
+            except Exception as e:
+                if st is not None:
+                    self._log(f"FETCH ERR {st.config.name}: {e}")
+                    with self.lock:
+                        st.status = f"FetchErr: {str(e)[:30]}"
+                else:
+                    self._log(f"[NIFTY SPOT FETCH ERR] {e}")
+            # Every 5 requests pause 1s — Dhan 5 req/sec limit
+            if (i + 1) % 5 == 0:
+                time.sleep(1.0)
 
         if self._stop.is_set():
             return
@@ -2530,18 +2505,8 @@ class HATradingApp(ctk.CTk):
             self._log_bg("[2/4] Loading master CSV...")
             rows=load_master_csv()
             self._log_bg(f"      {len(rows):,} rows")
-            self._log_bg("[3/4] Resolving NSE stocks...")
-            nse_ids=resolve_nse_stocks(rows,NSE_STOCKS)
+            self._log_bg("[3/4] Resolving MCX futures (top of list)...")
             instruments=[]
-            nq=self.nse_qty_var.get()
-            for sym in NSE_STOCKS:
-                sid=nse_ids.get(sym)
-                if not sid: continue
-                instruments.append(InstrumentState(
-                    config=InstrumentConfig(name=sym,exchange_segment="NSE_EQ",
-                        security_id=sid,product_type="INTRADAY",lot_multiplier=1),
-                    api_qty=nq))
-            self._log_bg("[4/4] Resolving MCX futures...")
             for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var),
                            ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var)]:
                 m=resolve_mcx_future(rows,sym,allow_pick=False)
@@ -2553,6 +2518,16 @@ class HATradingApp(ctk.CTk):
                         lot_multiplier=mult,trading_symbol=m["trading_symbol"],
                         expiry=m["expiry"]),
                     api_qty=lv.get()*mult))
+            self._log_bg("[4/4] Resolving NSE stocks...")
+            nse_ids=resolve_nse_stocks(rows,NSE_STOCKS)
+            nq=self.nse_qty_var.get()
+            for sym in NSE_STOCKS:
+                sid=nse_ids.get(sym)
+                if not sid: continue
+                instruments.append(InstrumentState(
+                    config=InstrumentConfig(name=sym,exchange_segment="NSE_EQ",
+                        security_id=sid,product_type="INTRADAY",lot_multiplier=1),
+                    api_qty=nq))
             self._log_bg(f"      {len(instruments)} instruments ready.")
             if not instruments:
                 self.after(0,lambda:self._on_start_error("No instruments resolved.")); return

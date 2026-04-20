@@ -1735,11 +1735,12 @@ class StrategyEngine:
                       and not self.nifty_state.sq_off_done
                       and not self.nifty_state.skip)
 
-        # Build fetch list: MCX → NIFTY spot → NSE
-        all_fetch = active_mcx[:]
+        # Build fetch list: NIFTY spot FIRST → MCX → NSE
+        # This ensures NIFTY signal and order fire before MCX/NSE
+        all_fetch = []
         if need_nifty:
-            all_fetch.append(None)   # None = NIFTY spot sentinel
-        all_fetch += active_nse
+            all_fetch.append(None)   # NIFTY spot sentinel — fetched first
+        all_fetch += active_mcx + active_nse
 
         # ── Sequential fetch: every 5 requests sleep 1s (Dhan 5 req/sec limit) ──
         for i, st in enumerate(all_fetch):
@@ -1797,10 +1798,25 @@ class StrategyEngine:
         if self._stop.is_set():
             return
 
-        # ── Step 2: Fire orders sequentially (100ms gap = safe at 10/sec) ────
+        # ── Step 2: Fire orders in priority order: NIFTY → MCX → NSE ────────
         ORDER_GAP = 0.12   # 120ms between orders → ~8/sec (safe margin under 10/sec)
 
-        for st in active:
+        # 2a. NIFTY options FIRST (spot already fetched)
+        if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
+            try:
+                self.nifty_engine.process(
+                    self.client_id, self.access_token,
+                    self.interval, startup,
+                    log_fn=self._log,
+                    lock=self.lock,
+                    cached_spot_candles=_nifty_spot_candles if _nifty_spot_candles else None,
+                )
+            except Exception as e:
+                self._log(f"[NIFTY ENGINE ERROR] {e}")
+            time.sleep(ORDER_GAP)
+
+        # 2b. MCX + NSE orders
+        for st in (active_mcx + active_nse):
             if self._stop.is_set():
                 break
             signal = signals.get(st.config.name)
@@ -1854,18 +1870,7 @@ class StrategyEngine:
                     arrow = "↑LONG" if st.position == "LONG" else "↓SHORT"
                     st.status = f"Holding {arrow}"
 
-        # ── Step 3: NIFTY options (uses pre-fetched spot candles) ────────────
-        if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
-            try:
-                self.nifty_engine.process(
-                    self.client_id, self.access_token,
-                    self.interval, startup,
-                    log_fn=self._log,
-                    lock=self.lock,
-                    cached_spot_candles=_nifty_spot_candles if _nifty_spot_candles else None,
-                )
-            except Exception as e:
-                self._log(f"[NIFTY ENGINE ERROR] {e}")
+        # NIFTY already processed in Step 2a above
 
     def _process(self, st: InstrumentState, startup: bool):
         candles = fetch_ohlc(

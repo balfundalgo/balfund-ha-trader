@@ -2393,25 +2393,44 @@ class HATradingApp(ctk.CTk):
     def _build_instrument_rows(self):
         for w in self.scroll.winfo_children(): w.destroy()
         self._rows.clear(); self._selected_idx=None
-        for idx,st in enumerate(self.instruments):
-            bg=C_ROW_A if idx%2==0 else C_ROW_B
-            row=InstrumentRow(self.scroll,idx+1,st,bg,
-                on_check=lambda s,c:setattr(s,"skip",not c),
-                on_click=self._select_row)
-            self._rows.append(row)
-        # Always show NIFTY options row (greyed if disabled)
+        # Row order: NIFTY first, then MCX, then NSE
+        row_counter = [0]   # mutable counter for alternating colours
+
+        # 1. NIFTY options row at TOP
         if self.nifty_opt_var.get() or self.nifty_state:
             if not self.nifty_state:
-                # Create placeholder state so row renders
                 self.nifty_state = NiftyOptionsState(
                     lots=self.nifty_lots_var.get(), skip=True)
-            self._build_nifty_row(len(self.instruments)+1)
+            self._build_nifty_row(row_counter[0] + 1)
+            row_counter[0] += 1
+
+        # 2. MCX instruments
+        for idx, st in enumerate(self.instruments):
+            if not st.config.is_mcx:
+                continue
+            bg = C_ROW_A if row_counter[0] % 2 == 0 else C_ROW_B
+            row = InstrumentRow(self.scroll, row_counter[0] + 1, st, bg,
+                on_check=lambda s, c: setattr(s, "skip", not c),
+                on_click=self._select_row)
+            self._rows.append(row)
+            row_counter[0] += 1
+
+        # 3. NSE stocks
+        for idx, st in enumerate(self.instruments):
+            if st.config.is_mcx:
+                continue
+            bg = C_ROW_A if row_counter[0] % 2 == 0 else C_ROW_B
+            row = InstrumentRow(self.scroll, row_counter[0] + 1, st, bg,
+                on_check=lambda s, c: setattr(s, "skip", not c),
+                on_click=self._select_row)
+            self._rows.append(row)
+            row_counter[0] += 1
 
     def _build_nifty_row(self, idx: int):
         """Special row for NIFTY ATM options."""
         bg = C_ROW_A if idx % 2 == 0 else C_ROW_B
         nst = self.nifty_state
-        nifty_idx = len(self.instruments)   # index past the normal rows
+        nifty_idx = -1   # sentinel: NIFTY is not in _rows list, use -1
         frame = ctk.CTkFrame(self.scroll, fg_color=bg, height=30, corner_radius=3)
         frame.pack(fill="x", padx=2, pady=1)
         frame.pack_propagate(False)
@@ -2445,24 +2464,26 @@ class HATradingApp(ctk.CTk):
             lbl = ctk.CTkLabel(frame, text="-", width=w, anchor="center",
                 font=ctk.CTkFont(size=11), text_color=C_GRAY)
             lbl.place(x=x, rely=0.5, anchor="w")
-            lbl.bind("<Button-1>", lambda e, i=nifty_idx: self._select_row(i))
+            lbl.bind("<Button-1>", lambda e: self._select_row(-1))
             self._nifty_labels[name] = lbl
             x += w + 2
 
     def _select_row(self,idx):
-        if self._selected_idx is not None and self._selected_idx<len(self._rows):
+        # Deselect previous
+        if self._selected_idx is not None and self._selected_idx >= 0                 and self._selected_idx < len(self._rows):
             self._rows[self._selected_idx].set_selected(False)
-        self._selected_idx=idx
-        if idx < len(self._rows):
+        self._selected_idx = idx
+        if idx == -1:
+            # NIFTY row
+            nst = self.nifty_state
+            pos = nst.position if nst else "FLAT"
+            self.selected_lbl.configure(
+                text=f"  NIFTY OPTIONS  ({pos})", text_color="white")
+        elif 0 <= idx < len(self._rows):
             self._rows[idx].set_selected(True)
-        if idx < len(self.instruments):
-            st=self.instruments[idx]
-            self.selected_lbl.configure(text=f"  {st.config.name}  ({st.position})",text_color="white")
-        else:
-            # NIFTY row selected
-            nst=self.nifty_state
-            pos=nst.position if nst else "FLAT"
-            self.selected_lbl.configure(text=f"  NIFTY OPTIONS  ({pos})",text_color="white")
+            st = self._rows[idx].st
+            self.selected_lbl.configure(
+                text=f"  {st.config.name}  ({st.position})", text_color="white")
 
     def _on_start(self):
         self.start_btn.configure(state="disabled",text="Resolving...")

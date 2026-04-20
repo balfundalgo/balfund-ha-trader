@@ -469,13 +469,19 @@ def fetch_ohlc(
         "fromDate":        start.strftime("%Y-%m-%d %H:%M:%S"),
         "toDate":          now.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    resp = requests.post(
-        INTRADAY_URL,
-        headers=build_headers(client_id, access_token),
-        json=payload,
-        timeout=20,
-    )
-    resp.raise_for_status()
+    # Retry once on 429 with 2s wait — Dhan Data API limit is 5 req/sec
+    for _attempt in range(3):
+        resp = requests.post(
+            INTRADAY_URL,
+            headers=build_headers(client_id, access_token),
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code == 429:
+            time.sleep(2.0 * (_attempt + 1))   # 2s, 4s, 6s
+            continue
+        resp.raise_for_status()
+        break
     data = resp.json()
 
     opens      = data.get("open",      [])
@@ -768,10 +774,17 @@ def resolve_mcx_future(
             _gui_log(f"      {s}")
         return None
 
+    tomorrow = today + timedelta(days=1)
     active  = sorted(
-        [(e, s, t) for e, s, t in found if e and e >= today],
+        [(e, s, t) for e, s, t in found if e and e >= tomorrow],  # skip if expires today
         key=lambda x: x[0]
     )
+    # Fallback: if nothing found for tomorrow+, include today's expiry
+    if not active:
+        active = sorted(
+            [(e, s, t) for e, s, t in found if e and e >= today],
+            key=lambda x: x[0]
+        )
     no_exp  = [(e, s, t) for e, s, t in found if not e]
     ordered = active + no_exp
 
@@ -1763,7 +1776,7 @@ class StrategyEngine:
         # Use class-level shared gate — persists across ALL polls.
         # Dhan Data API: 5 req/sec → 200ms minimum gap between requests.
         _gate = self._ohlc_gate   # ← shared, never reset
-        GAP = 0.20
+        GAP = 0.25   # 4 req/sec (Dhan limit: 5/sec, 20% safety margin)
 
         def _fetch_gated(st):
             with _gate:
@@ -1864,10 +1877,6 @@ class StrategyEngine:
         # ── Step 3: NIFTY options (uses pre-fetched spot candles) ────────────
         if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
             try:
-                # Wait for nifty spot fetch to complete (already in flight)
-                if nifty_fut:
-                    try: nifty_fut.result(timeout=10)
-                    except Exception: pass
                 self.nifty_engine.process(
                     self.client_id, self.access_token,
                     self.interval, startup,

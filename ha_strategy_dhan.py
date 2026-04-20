@@ -326,6 +326,9 @@ MASTER_CACHE_MAX_AGE_H = 24          # hours before re-download
 MCX_LOT_MULTIPLIERS: Dict[str, int] = {
     "GOLDTEN":     1,   # 1 lot = 10g
     "SILVERMICRO": 1,   # 1 lot = 1000g
+    "CRUDEOILM":   1,   # 1 lot = 10 barrels (mini crude)
+    "ZINCMINI":    1,   # 1 lot = 1000 kg (mini zinc)
+    "ZINCM":       1,   # alternate name in Dhan CSV
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2245,7 +2248,7 @@ class HATradingApp(ctk.CTk):
                         security_id=sid, product_type="INTRADAY", lot_multiplier=1),
                     api_qty=nq))
             for sym, lv in [("GOLDTEN", self.gold_lots_var), ("SILVERMICRO", self.silv_lots_var),
-                             ("CRUDEOILM", self.crude_lots_var), ("ZINCMINI", self.zinc_lots_var)]:
+                             ("CRUDEOILM", self.crude_lots_var), ("ZINCMINI", self.zinc_lots_var), ("ZINCM", self.zinc_lots_var)]:
                 m = resolve_mcx_future(rows, sym, allow_pick=False)
                 if not m: continue
                 mult = MCX_LOT_MULTIPLIERS[sym]
@@ -2542,10 +2545,10 @@ class HATradingApp(ctk.CTk):
                     api_qty=nq))
             self._log_bg("[4/4] Resolving MCX futures...")
             for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var),
-                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var)]:
+                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var),("ZINCM",self.zinc_lots_var)]:
                 m=resolve_mcx_future(rows,sym,allow_pick=False)
                 if not m: self._log_bg(f"      WARNING: {sym} not found"); continue
-                mult=MCX_LOT_MULTIPLIERS[sym]
+                mult=MCX_LOT_MULTIPLIERS.get(sym,1)
                 instruments.append(InstrumentState(
                     config=InstrumentConfig(name=sym,exchange_segment="MCX_COMM",
                         security_id=m["security_id"],product_type="INTRADAY",

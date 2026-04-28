@@ -323,12 +323,15 @@ MASTER_CACHE_MAX_AGE_H = 24          # hours before re-download
 #  Dhan MCX API takes quantity in LOTS (same way NSE takes shares).
 #  quantity = 1 → 1 lot of GOLDTEN (10g) or SILVERMICRO (1000g)
 # ─────────────────────────────────────────────────────────────────────────────
+# MCX P&L multipliers: physical units per lot
+# Order qty sent to Dhan is always "number of lots" (1, 2, etc.)
+# P&L = price_diff_per_unit × lot_multiplier × num_lots
 MCX_LOT_MULTIPLIERS: Dict[str, int] = {
-    "GOLDTEN":     1,
-    "SILVERMICRO": 1,
-    "CRUDEOILM":   1,
-    "ZINCMINI":    1,
-    "GOLDPETAL":   1,
+    "GOLDTEN":     1,      # price per 10g, lot = 10g   → ₹1/move per lot
+    "GOLDPETAL":   1,      # price per 1g,  lot = 1g    → ₹1/move per lot
+    "SILVERMICRO": 1,      # price per kg,  lot = 1kg   → ₹1/move per lot
+    "CRUDEOILM":   10,     # price per BBL, lot = 10BBL → ₹10/move per lot
+    "ZINCMINI":    1000,   # price per kg,  lot = 1MT   → ₹1000/move per lot
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2441,7 +2444,7 @@ class HATradingApp(ctk.CTk):
                         security_id=m["security_id"], product_type="INTRADAY",
                         lot_multiplier=mult, trading_symbol=m["trading_symbol"],
                         expiry=m["expiry"]),
-                    api_qty=lv.get() * mult))
+                    api_qty=lv.get()))  # order qty = number of lots only
             if instruments:
                 self.instruments = instruments
                 # Create placeholder NIFTY state for display
@@ -2735,7 +2738,7 @@ class HATradingApp(ctk.CTk):
                         security_id=m["security_id"],product_type="INTRADAY",
                         lot_multiplier=mult,trading_symbol=m["trading_symbol"],
                         expiry=m["expiry"]),
-                    api_qty=lv.get()*mult))
+                    api_qty=lv.get()))  # order qty = number of lots only
             self._log_bg("[4/4] Resolving NSE stocks...")
             nse_ids=resolve_nse_stocks(rows,NSE_STOCKS)
             nq=self.nse_qty_var.get()

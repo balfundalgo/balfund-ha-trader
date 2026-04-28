@@ -324,10 +324,11 @@ MASTER_CACHE_MAX_AGE_H = 24          # hours before re-download
 #  quantity = 1 → 1 lot of GOLDTEN (10g) or SILVERMICRO (1000g)
 # ─────────────────────────────────────────────────────────────────────────────
 MCX_LOT_MULTIPLIERS: Dict[str, int] = {
-    "GOLDTEN":     1,   # 1 lot = 10g
-    "SILVERMICRO": 1,   # 1 lot = 1000g
-    "CRUDEOILM":   1,   # 1 lot = 10 barrels (mini crude)
-    "ZINCMINI":    1,   # 1 lot = 1000 kg (mini zinc)
+    "GOLDTEN":     1,
+    "SILVERMICRO": 1,
+    "CRUDEOILM":   1,
+    "ZINCMINI":    1,
+    "GOLDPETAL":   1,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -827,6 +828,51 @@ def resolve_mcx_future(
 # ─────────────────────────────────────────────────────────────────────────────
 #  DATA STRUCTURES
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CANDLE AGGREGATOR  (used for 5-second WS-based candles)
+# ─────────────────────────────────────────────────────────────────────────────
+class CandleAggregator:
+    """Builds OHLC candles from live tick data for a given interval in seconds."""
+
+    def __init__(self, interval_sec: int, seed_candles: Optional[List[Dict]] = None):
+        self.interval_sec   = interval_sec
+        self._closed:  List[Dict] = list(seed_candles) if seed_candles else []
+        self._current: Optional[Dict] = None
+        self._lock = threading.Lock()
+
+    def on_tick(self, price: float, ts: float) -> Optional[Dict]:
+        """Feed a tick. Returns the just-closed candle if a boundary was crossed."""
+        bucket = int(ts // self.interval_sec) * self.interval_sec
+        with self._lock:
+            if self._current is None or self._current["bucket"] != bucket:
+                closed = self._current
+                if closed:
+                    self._closed.append(closed)
+                    if len(self._closed) > 500:
+                        self._closed = self._closed[-500:]
+                self._current = {"bucket": bucket,
+                                 "open": price, "high": price,
+                                 "low": price,  "close": price}
+                return closed
+            else:
+                c = self._current
+                if price > c["high"]: c["high"] = price
+                if price < c["low"]:  c["low"]  = price
+                c["close"] = price
+                return None
+
+    def get_candles(self, include_current: bool = False) -> List[Dict]:
+        with self._lock:
+            result = list(self._closed)
+            if include_current and self._current:
+                result.append(dict(self._current))
+            return result
+
+    def has_enough(self, min_candles: int = 2) -> bool:
+        with self._lock:
+            return len(self._closed) >= min_candles
 
 @dataclass
 class InstrumentConfig:
@@ -1533,9 +1579,11 @@ class StrategyEngine:
         self.nifty_engine: Optional[NiftyOptionsEngine] = None
         self._nifty_opt_sid: str = ""   # security_id of active option being tracked
         # Shared rate gate for ALL OHLC fetches across all polls
-        # Dhan Data API: 5 req/sec → 200ms minimum gap enforced here
         import threading as _th
         self._ohlc_gate = _th.Lock()
+        # Candle aggregators for 5-second WS-driven mode (sid → CandleAggregator)
+        self._aggregators: Dict[str, CandleAggregator] = {}
+        self._is_5s_mode: bool = False
 
     def start(self):
         self._stop.clear()
@@ -1643,18 +1691,158 @@ class StrategyEngine:
 
     def _run(self):
         self._log("Engine started")
+        if self._is_5s_mode:
+            self._run_5s()
+        else:
+            self._run_rest()
+        self._log("Engine stopped")
+
+    def _run_rest(self):
+        """Standard REST-polling loop (1m/5m/15m timeframes)."""
         self._poll_all(startup=True)
         self._set_next_poll()
-
         while not self._stop.is_set():
             self._wait_for_next_poll()
-            if self._stop.is_set():
-                break
+            if self._stop.is_set(): break
             self._check_auto_squareoff()
             self._poll_all(startup=False)
             self._set_next_poll()
 
-        self._log("Engine stopped")
+    def _run_5s(self):
+        """5-second WS-driven loop — builds candles from live ticks."""
+        # ── Seed aggregators with historical 1-min REST data ─────────────────
+        self._log("[5s] Seeding aggregators from REST history...")
+        self._init_5s_aggregators()
+        self._log("[5s] Aggregators ready — running on WS ticks")
+
+        # ── Startup: fire initial signals from seeded data ───────────────────
+        self._process_5s_signals(startup=True)
+        self._set_next_poll_5s()
+
+        while not self._stop.is_set():
+            self._wait_for_5s_boundary()
+            if self._stop.is_set(): break
+            self._check_auto_squareoff()
+            self._process_5s_signals(startup=False)
+            self._set_next_poll_5s()
+
+    def _init_5s_aggregators(self):
+        """Fetch 1-min REST candles for each instrument and seed aggregators."""
+        all_insts = list(self.instruments)
+        need_nifty = (self.nifty_engine and self.nifty_state
+                      and not self.nifty_state.skip)
+
+        for i, st in enumerate(all_insts):
+            try:
+                candles = fetch_ohlc(self.client_id, self.access_token,
+                                     st.config.security_id,
+                                     st.config.exchange_segment, "1")
+                agg_key = f"{st.config.exchange_segment}:{st.config.security_id}"
+                self._aggregators[agg_key] = CandleAggregator(5, seed_candles=candles[-50:])
+                self._log(f"[5s] Seeded {st.config.name} ({len(candles)} 1m bars)")
+            except Exception as e:
+                self._log(f"[5s] Seed ERR {st.config.name}: {e}")
+            if (i + 1) % 5 == 0:
+                time.sleep(1.0)
+
+        if need_nifty:
+            try:
+                candles = fetch_ohlc(self.client_id, self.access_token,
+                                     NIFTY_SPOT_SID, NIFTY_SPOT_SEG, "1")
+                agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
+                self._aggregators[agg_key] = CandleAggregator(5, seed_candles=candles[-50:])
+                self._log(f"[5s] Seeded NIFTY spot ({len(candles)} 1m bars)")
+            except Exception as e:
+                self._log(f"[5s] NIFTY seed ERR: {e}")
+
+    def _set_next_poll_5s(self):
+        next_5 = (int(time.time()) // 5 + 1) * 5
+        self.next_poll_at = datetime.fromtimestamp(next_5).strftime("%H:%M:%S")
+
+    def _wait_for_5s_boundary(self):
+        next_5 = (int(time.time()) // 5 + 1) * 5
+        while time.time() < next_5 and not self._stop.is_set():
+            time.sleep(0.05)   # 50ms precision
+
+    def _process_5s_signals(self, startup: bool):
+        """Compute HA from WS-aggregated candles and fire orders."""
+        signals: Dict[str, Optional[str]] = {}
+        _nifty_spot_candles: list = []
+
+        # Process NIFTY spot first
+        need_nifty = (self.nifty_engine and self.nifty_state
+                      and not self.nifty_state.sq_off_done
+                      and not self.nifty_state.skip)
+        if need_nifty:
+            agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
+            agg = self._aggregators.get(agg_key)
+            if agg:
+                _nifty_spot_candles = agg.get_candles(include_current=False)
+
+        # Process each instrument
+        active_mcx = [st for st in self.instruments
+                      if not st.skip and not st.sq_off_done
+                      and self._in_session(st.config) and st.config.is_mcx]
+        active_nse = [st for st in self.instruments
+                      if not st.skip and not st.sq_off_done
+                      and self._in_session(st.config) and not st.config.is_mcx]
+
+        for st in (active_mcx + active_nse):
+            agg_key = f"{st.config.exchange_segment}:{st.config.security_id}"
+            agg = self._aggregators.get(agg_key)
+            if not agg or not agg.has_enough(2):
+                with self.lock:
+                    st.status = "Waiting ticks..."
+                continue
+            candles = agg.get_candles(include_current=False)
+            if len(candles) < 2:
+                continue
+            ha      = compute_ha(candles)
+            last_ha = ha[-1]
+            color   = ha_color(last_ha)
+            bar_ts  = datetime.fromtimestamp(last_ha["bucket"]).strftime("%H:%M:%S")
+            with self.lock:
+                st.ha_open    = round(last_ha["open"],  2)
+                st.ha_close   = round(last_ha["close"], 2)
+                st.color      = color
+                st.bar_time   = bar_ts
+                st.last_update = now_str()
+            if color == "DOJI":
+                with self.lock: st.status = "DOJI — holding"
+                continue
+            signal = "BUY" if color == "GREEN" else "SELL"
+            with self.lock: st.last_signal = signal
+            signals[st.config.name] = signal
+
+        # ── Fire orders: NIFTY first, then MCX, then NSE ─────────────────────
+        ORDER_GAP = 0.12
+        if self.nifty_engine and self.nifty_state and not self.nifty_state.sq_off_done:
+            try:
+                self.nifty_engine.process(
+                    self.client_id, self.access_token,
+                    "1", startup,   # pass "1" as interval for option chain logic
+                    log_fn=self._log, lock=self.lock,
+                    cached_spot_candles=_nifty_spot_candles or None,
+                )
+            except Exception as e:
+                self._log(f"[NIFTY ENGINE ERROR] {e}")
+            time.sleep(ORDER_GAP)
+
+        for st in (active_mcx + active_nse):
+            if self._stop.is_set(): break
+            signal = signals.get(st.config.name)
+            if signal is None: continue
+            if signal == "BUY" and st.position != "LONG":
+                if st.position == "FLAT": self._open_position(st, signal)
+                else: self._reverse_position(st, signal)
+                time.sleep(ORDER_GAP)
+            elif signal == "SELL" and st.position != "SHORT":
+                if st.position == "FLAT": self._open_position(st, signal)
+                else: self._reverse_position(st, signal)
+                time.sleep(ORDER_GAP)
+            else:
+                with self.lock:
+                    st.status = "↑LONG" if st.position == "LONG" else "↓SHORT"
 
     def _set_next_poll(self):
         iv_sec           = int(self.interval) * 60
@@ -2180,7 +2368,8 @@ class InstrumentRow:
         lbl(CI_POS,st.position,{"LONG":C_GREEN,"SHORT":C_RED,"FLAT":C_GRAY}.get(st.position,C_GRAY))
         lbl(CI_ENT,f"{st.entry_price:.2f}" if st.entry_price else "-")
         mcx_lots = {"GOLDTEN":gold_lots,"SILVERMICRO":silv_lots,
-                    "CRUDEOILM":crude_lots,"ZINCMINI":zinc_lots}.get(st.config.name,1)
+                    "CRUDEOILM":crude_lots,"ZINCMINI":zinc_lots,
+                    "GOLDPETAL":gold_lots}.get(st.config.name,1)
         qty=(str(st.user_qty) if st.position!="FLAT"
              else str(mcx_lots if st.config.is_mcx else nse_qty))
         lbl(CI_QTY,qty,C_GRAY)
@@ -2296,7 +2485,7 @@ class HATradingApp(ctk.CTk):
             ctk.CTkLabel(f,text=title,font=ctk.CTkFont(size=13,weight="bold"),
                 text_color=C_BLUE).pack(pady=(14,8)); return f
         tf=card(0,"Candle Timeframe")
-        for v,l in [("1","1 Minute"),("5","5 Minutes"),("15","15 Minutes")]:
+        for v,l in [("5s","5 Seconds (WS)"),("1","1 Minute"),("5","5 Minutes"),("15","15 Minutes")]:
             ctk.CTkRadioButton(tf,text=l,variable=self.interval_var,
                 value=v,font=ctk.CTkFont(size=12)).pack(anchor="w",padx=22,pady=5)
         qf=card(1,"Quantity per Trade")
@@ -2304,7 +2493,8 @@ class HATradingApp(ctk.CTk):
                       ("GOLDTEN:",self.gold_lots_var,"lots"),
                       ("SILVERMICRO:",self.silv_lots_var,"lots"),
                       ("CRUDEOILM:",self.crude_lots_var,"lots"),
-                      ("ZINCMINI:",self.zinc_lots_var,"lots")]:
+                      ("ZINCMINI:",self.zinc_lots_var,"lots"),
+                      ("GOLDPETAL:",self.goldpetal_lots_var,"lots")]:
             r=ctk.CTkFrame(qf,fg_color="transparent"); r.pack(fill="x",padx=16,pady=5)
             ctk.CTkLabel(r,text=l,width=130,anchor="w",font=ctk.CTkFont(size=12)).pack(side="left")
             ctk.CTkEntry(r,textvariable=v,width=70,font=ctk.CTkFont(size=12)).pack(side="left",padx=6)
@@ -2534,7 +2724,8 @@ class HATradingApp(ctk.CTk):
             self._log_bg("[3/4] Resolving MCX futures (top of list)...")
             instruments=[]
             for sym,lv in [("GOLDTEN",self.gold_lots_var),("SILVERMICRO",self.silv_lots_var),
-                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var)]:
+                           ("CRUDEOILM",self.crude_lots_var),("ZINCMINI",self.zinc_lots_var),
+                           ("GOLDPETAL",self.goldpetal_lots_var)]:
                 m=resolve_mcx_future(rows,sym,allow_pick=False)
                 if not m: self._log_bg(f"      WARNING: {sym} not found"); continue
                 mult=MCX_LOT_MULTIPLIERS.get(sym,1)
@@ -2579,7 +2770,7 @@ class HATradingApp(ctk.CTk):
         paper=self.paper_var.get()
         self.engine=StrategyEngine(
             client_id=self._client_id,access_token=self._access_token,
-            instruments=self.instruments,interval=self.interval_var.get(),
+            instruments=self.instruments,interval=self.interval_var.get() if self.interval_var.get()!="5s" else "1",
             nse_sq_time=self.nse_sq_var.get(),mcx_sq_time=self.mcx_sq_var.get(),
             paper_mode=paper)
         # Wire NIFTY options engine if enabled and not skipped
@@ -2592,7 +2783,8 @@ class HATradingApp(ctk.CTk):
         self.tabs.set("Live Strategy")
         self.mode_lbl.configure(text="PAPER" if paper else "LIVE",
             text_color=C_YELLOW if paper else C_RED)
-        status_txt=f"Running | TF={self.interval_var.get()}min | {len(self.instruments)} instruments | {'PAPER' if paper else 'LIVE'}"
+        iv_disp = "5s(WS)" if self.interval_var.get()=="5s" else f"{self.interval_var.get()}min"
+        status_txt=f"Running | TF={iv_disp} | {len(self.instruments)} instruments | {'PAPER' if paper else 'LIVE'}"
         self.start_btn.configure(state="disabled",text="RUNNING")
         self.stop_btn.configure(state="normal")
         self.tab_start_btn.configure(state="disabled",text="RUNNING")

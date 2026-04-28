@@ -2400,6 +2400,7 @@ class HATradingApp(ctk.CTk):
         self.silv_lots_var=ctk.IntVar(value=1)
         self.crude_lots_var=ctk.IntVar(value=1)
         self.zinc_lots_var=ctk.IntVar(value=1)
+        self.goldpetal_lots_var=ctk.IntVar(value=1)
         self.nse_sq_var=ctk.StringVar(value="15:15")
         self.mcx_sq_var=ctk.StringVar(value="23:25")
         self.paper_var=ctk.BooleanVar(value=True)

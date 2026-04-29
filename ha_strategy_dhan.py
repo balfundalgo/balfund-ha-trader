@@ -2031,7 +2031,10 @@ class StrategyEngine:
         if stale:
             self._log(f"[WS] STALE ticks (>30s): {', '.join(stale)}")
         if no_tick and not startup:
-            self._log(f"[WS] NO ticks yet: {', '.join(no_tick)}")
+            # In 5s mode, WS ticks feed aggregators — REST poll won't see last_tick_ts
+            # Only warn if NOT 5s mode
+            if not self._is_5s_mode:
+                self._log(f"[WS] NO ticks yet: {', '.join(no_tick)}")
 
         # ── Step 2: Fire orders in priority order: NIFTY → MCX → NSE ────────
         ORDER_GAP = 0.12   # 120ms between orders → ~8/sec (safe margin under 10/sec)
@@ -2817,11 +2820,23 @@ class HATradingApp(ctk.CTk):
     def _on_resolved(self):
         self._build_instrument_rows()
         paper=self.paper_var.get()
+        _iv_sel = self.interval_var.get()
+        _is5s   = (_iv_sel == "5s")
         self.engine=StrategyEngine(
             client_id=self._client_id,access_token=self._access_token,
-            instruments=self.instruments,interval=self.interval_var.get() if self.interval_var.get()!="5s" else "1",
+            instruments=self.instruments,
+            interval="1" if _is5s else _iv_sel,
             nse_sq_time=self.nse_sq_var.get(),mcx_sq_time=self.mcx_sq_var.get(),
             paper_mode=paper)
+        # ── Set 5s mode BEFORE wiring engines and starting ───────────────────
+        self.engine._is_5s_mode = _is5s
+        if _is5s:
+            for _st in self.instruments:
+                _ak = f"{_st.config.exchange_segment}:{_st.config.security_id}"
+                self.engine._aggregators[_ak] = CandleAggregator(5)
+            self.engine._aggregators[
+                f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"] = CandleAggregator(5)
+            self._log_bg("[5s] WS candle mode — aggregators created for all instruments")
         # Wire NIFTY options engine if enabled and not skipped
         if self.nifty_state and not self.nifty_state.skip and self._master_rows:
             self.engine.set_nifty_engine(self.nifty_state, self._master_rows)

@@ -1120,27 +1120,36 @@ class MultiTickerWS:
             self._log(f"[WS] Subscribed NIFTY option: NSE_FNO:{security_id}")
 
     def _on_ws_tick(self, security_id: str, ltp: float, exch_seg: str = ""):
-        """Called on every live tick — update LTP immediately.
-        Uses segment:security_id key to avoid conflicts (e.g. ABB and NIFTY both sid=13).
-        """
-        # Try segment-qualified key first (most accurate)
+        """Called on every live tick — update LTP + tick timestamp immediately."""
         seg_key = f"{exch_seg}:{security_id}" if exch_seg else ""
         st = self._sid_map.get(seg_key) if seg_key else None
-        # Fallback to just security_id if segment-key not found
         if st is None:
             st = self._sid_map.get(security_id)
         if st:
+            now = time.time()
             with self.lock:
-                st.last_ltp = round(ltp, 2)
+                st.last_ltp     = round(ltp, 2)
+                st.last_tick_ts = now   # ← track tick time for WS health display
+            # Feed 5s aggregator
+            if self._is_5s_mode:
+                agg_key = seg_key or security_id
+                agg = self._aggregators.get(agg_key)
+                if agg:
+                    agg.on_tick(ltp, now)
             self.ws_ticks += 1
             return
-        # Route NIFTY spot tick to nifty_state.spot_ltp
+        # NIFTY spot tick
         if security_id == NIFTY_SPOT_SID and self.nifty_state:
             with self.lock:
                 self.nifty_state.spot_ltp = round(ltp, 2)
+            if self._is_5s_mode:
+                agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
+                agg = self._aggregators.get(agg_key)
+                if agg:
+                    agg.on_tick(ltp, time.time())
             self.ws_ticks += 1
             return
-        # Route NIFTY option tick to nifty_state.opt_ltp
+        # NIFTY option tick
         opt_sid = getattr(self, "_nifty_opt_sid", "")
         if opt_sid and security_id == opt_sid and self.nifty_state:
             with self.lock:
@@ -1651,27 +1660,36 @@ class StrategyEngine:
             self._log(f"[WS] Subscribed NIFTY option: NSE_FNO:{security_id}")
 
     def _on_ws_tick(self, security_id: str, ltp: float, exch_seg: str = ""):
-        """Called on every live tick — update LTP immediately.
-        Uses segment:security_id key to avoid conflicts (e.g. ABB and NIFTY both sid=13).
-        """
-        # Try segment-qualified key first (most accurate)
+        """Called on every live tick — update LTP + tick timestamp immediately."""
         seg_key = f"{exch_seg}:{security_id}" if exch_seg else ""
         st = self._sid_map.get(seg_key) if seg_key else None
-        # Fallback to just security_id if segment-key not found
         if st is None:
             st = self._sid_map.get(security_id)
         if st:
+            now = time.time()
             with self.lock:
-                st.last_ltp = round(ltp, 2)
+                st.last_ltp     = round(ltp, 2)
+                st.last_tick_ts = now   # ← track tick time for WS health display
+            # Feed 5s aggregator
+            if self._is_5s_mode:
+                agg_key = seg_key or security_id
+                agg = self._aggregators.get(agg_key)
+                if agg:
+                    agg.on_tick(ltp, now)
             self.ws_ticks += 1
             return
-        # Route NIFTY spot tick to nifty_state.spot_ltp
+        # NIFTY spot tick
         if security_id == NIFTY_SPOT_SID and self.nifty_state:
             with self.lock:
                 self.nifty_state.spot_ltp = round(ltp, 2)
+            if self._is_5s_mode:
+                agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
+                agg = self._aggregators.get(agg_key)
+                if agg:
+                    agg.on_tick(ltp, time.time())
             self.ws_ticks += 1
             return
-        # Route NIFTY option tick to nifty_state.opt_ltp
+        # NIFTY option tick
         opt_sid = getattr(self, "_nifty_opt_sid", "")
         if opt_sid and security_id == opt_sid and self.nifty_state:
             with self.lock:
@@ -2391,8 +2409,9 @@ class InstrumentRow:
             lbl(CI_STA,"Skipped",C_GRAY); return
         lbl(CI_HAO,f"{st.ha_open:.2f}" if st.ha_open else "-")
         lbl(CI_HAC,f"{st.ha_close:.2f}" if st.ha_close else "-")
-        lbl(CI_COL,st.color if st.color!="-" else "-",
-            {"GREEN":C_GREEN,"RED":C_RED,"DOJI":C_YELLOW}.get(st.color,C_GRAY))
+        col_sym = {"GREEN":"▲ GREEN","RED":"▼ RED","DOJI":"— DOJI"}.get(st.color, "-")
+        lbl(CI_COL, col_sym,
+            {"GREEN":C_GREEN,"RED":C_RED,"DOJI":C_YELLOW}.get(st.color, C_GRAY))
         lbl(CI_SIG,st.last_signal,{"BUY":C_GREEN,"SELL":C_RED}.get(st.last_signal,C_GRAY))
         lbl(CI_POS,st.position,{"LONG":C_GREEN,"SHORT":C_RED,"FLAT":C_GRAY}.get(st.position,C_GRAY))
         lbl(CI_ENT,f"{st.entry_price:.2f}" if st.entry_price else "-")

@@ -783,12 +783,20 @@ def resolve_mcx_future(
             _gui_log(f"      {s}")
         return None
 
-    tomorrow = today + timedelta(days=1)
+    # Skip contracts expiring within next 2 days (MCX stops trading 1-2 days before expiry)
+    safe_date = today + timedelta(days=2)
     active  = sorted(
-        [(e, s, t, l) for e, s, t, l in found if e and e >= tomorrow],
+        [(e, s, t, l) for e, s, t, l in found if e and e >= safe_date],
         key=lambda x: x[0]
     )
     if not active:
+        # Fallback: try tomorrow
+        active = sorted(
+            [(e, s, t, l) for e, s, t, l in found if e and e > today],
+            key=lambda x: x[0]
+        )
+    if not active:
+        # Last resort: today
         active = sorted(
             [(e, s, t, l) for e, s, t, l in found if e and e >= today],
             key=lambda x: x[0]
@@ -2827,7 +2835,8 @@ class HATradingApp(ctk.CTk):
                 self.sum_lbl.configure(
                     text=f"{longs} LONG   {shorts} SHORT   "
                          f"{active}/{len(self.instruments)} active   "
-                         f"Next poll: {self.engine.next_poll_at}   REST + WS live LTP")
+                         f"Next poll: {self.engine.next_poll_at if not self.engine._is_5s_mode else '5s boundary'}   "
+                         f"{'WS: ✓ LIVE' if self.engine.ws_status.startswith('WS connected') else 'WS: ✕ ' + self.engine.ws_status[:20]}")
                 nq=self.nse_qty_var.get(); gl=self.gold_lots_var.get(); sl=self.silv_lots_var.get()
                 for row in self._rows: row.update(nq,gl,sl,self.crude_lots_var.get(),self.zinc_lots_var.get())
                 # Update NIFTY row

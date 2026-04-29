@@ -1422,6 +1422,11 @@ class NiftyOptionsEngine:
                 time.sleep(0.5)
             self._enter_option(client_id, access_token, opt_type,
                                atm_strike, spot, log_fn, lock)
+        else:
+            # Holding — log every poll so user knows NIFTY is being processed
+            log_fn(f"[NIFTY] Holding {current_pos} | HA={color} @ {bar_ts} | spot={spot:.0f}")
+            with lock:
+                st.status = f"Hold {current_pos} | HA={color} @{bar_ts}"
 
     def _enter_option(self, client_id, access_token, opt_type,
                       atm_strike, spot, log_fn, lock):
@@ -1996,6 +2001,16 @@ class StrategyEngine:
 
         if self._stop.is_set():
             return
+
+        # ── WS Tick health check ─────────────────────────────────────────────
+        now_ts = time.time()
+        stale  = [st.config.name for st in self.instruments
+                  if st.last_tick_ts > 0 and (now_ts - st.last_tick_ts) > 30]
+        no_tick = [st.config.name for st in self.instruments if st.last_tick_ts == 0]
+        if stale:
+            self._log(f"[WS] STALE ticks (>30s): {', '.join(stale)}")
+        if no_tick and not startup:
+            self._log(f"[WS] NO ticks received: {', '.join(no_tick)}")
 
         # ── Step 2: Fire orders in priority order: NIFTY → MCX → NSE ────────
         ORDER_GAP = 0.12   # 120ms between orders → ~8/sec (safe margin under 10/sec)

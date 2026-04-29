@@ -1758,6 +1758,7 @@ class StrategyEngine:
                 self._log(f"[5s] Seeded {st.config.name} ({len(candles)} 1m bars)")
             except Exception as e:
                 self._log(f"[5s] Seed ERR {st.config.name}: {e}")
+            # Rate limit only needed for seed (one-time REST, then pure WS)
             if (i + 1) % 5 == 0:
                 time.sleep(1.0)
 
@@ -2002,15 +2003,17 @@ class StrategyEngine:
         if self._stop.is_set():
             return
 
-        # ── WS Tick health check ─────────────────────────────────────────────
-        now_ts = time.time()
-        stale  = [st.config.name for st in self.instruments
-                  if st.last_tick_ts > 0 and (now_ts - st.last_tick_ts) > 30]
-        no_tick = [st.config.name for st in self.instruments if st.last_tick_ts == 0]
+        # ── WS Tick health check (runs every poll regardless of mode) ───────
+        now_ts  = time.time()
+        stale   = [st.config.name for st in self.instruments
+                   if getattr(st, "last_tick_ts", 0) > 0
+                   and (now_ts - getattr(st, "last_tick_ts", 0)) > 30]
+        no_tick = [st.config.name for st in self.instruments
+                   if getattr(st, "last_tick_ts", 0) == 0]
         if stale:
             self._log(f"[WS] STALE ticks (>30s): {', '.join(stale)}")
         if no_tick and not startup:
-            self._log(f"[WS] NO ticks received: {', '.join(no_tick)}")
+            self._log(f"[WS] NO ticks yet: {', '.join(no_tick)}")
 
         # ── Step 2: Fire orders in priority order: NIFTY → MCX → NSE ────────
         ORDER_GAP = 0.12   # 120ms between orders → ~8/sec (safe margin under 10/sec)

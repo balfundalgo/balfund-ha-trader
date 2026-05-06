@@ -423,13 +423,20 @@ def prompt(msg: str, default: str) -> str:
 #  HEIKIN ASHI ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_ha(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def compute_ha(candles: List[Dict[str, Any]],
+               sma_period: int = 1) -> List[Dict[str, Any]]:
     """
+    Heikin-Ashi with optional SMA smoothing (Smoothed HA).
+    sma_period=1 → standard HA (no smoothing, current behaviour).
+    sma_period=N → SHA: apply N-period SMA to HA open & close before signal.
+
     HA Close = (O + H + L + C) / 4
-    HA Open  = (prev_HA_Open + prev_HA_Close) / 2   [first bar: (O+C)/2]
-    HA High  = max(High, HA_Open, HA_Close)
-    HA Low   = min(Low,  HA_Open, HA_Close)
+    HA Open  = (prev_HA_Open + prev_HA_Close) / 2
+    SHA Close = SMA(HA_Close, N)
+    SHA Open  = SMA(HA_Open,  N)
+    Signal    = SHA_Close > SHA_Open → GREEN else RED
     """
+    # Step 1: raw HA candles
     ha: List[Dict[str, Any]] = []
     for i, c in enumerate(candles):
         o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
@@ -442,7 +449,28 @@ def compute_ha(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "low":    min(l, ha_open, ha_close),
             "close":  ha_close,
         })
-    return ha
+
+    if sma_period <= 1:
+        return ha   # no smoothing needed
+
+    # Step 2: apply SMA(period) to HA open & close → Smoothed HA
+    p = sma_period
+    sha: List[Dict[str, Any]] = []
+    for i, bar in enumerate(ha):
+        if i < p - 1:
+            # Not enough bars yet — use raw HA values
+            sha.append(dict(bar))
+        else:
+            sma_close = sum(ha[j]["close"] for j in range(i - p + 1, i + 1)) / p
+            sma_open  = sum(ha[j]["open"]  for j in range(i - p + 1, i + 1)) / p
+            sha.append({
+                "bucket": bar["bucket"],
+                "open":   sma_open,
+                "high":   max(bar["high"], sma_open, sma_close),
+                "low":    min(bar["low"],  sma_open, sma_close),
+                "close":  sma_close,
+            })
+    return sha
 
 def ha_color(candle: Dict[str, Any]) -> str:
     if candle["close"] > candle["open"]: return "GREEN"
@@ -1344,6 +1372,7 @@ class NiftyOptionsEngine:
         log_fn,        # callable
         lock,
         cached_spot_candles=None,   # pre-fetched from parallel pool
+        sma_period:   int = 1,      # smoothing period — matches strategy setting
     ):
         st = self.state
         if st.skip:
@@ -1385,7 +1414,7 @@ class NiftyOptionsEngine:
                 return
 
         # ── Compute HA ───────────────────────────────────────────────────────
-        ha_candles = compute_ha(candles)
+        ha_candles = compute_ha(candles, sma_period)
         last_ha    = ha_candles[-1]
         color      = ha_color(last_ha)
         spot       = candles[-1]["close"]
@@ -1603,6 +1632,7 @@ class StrategyEngine:
         self.nifty_state:  Optional[NiftyOptionsState]  = None
         self.nifty_engine: Optional[NiftyOptionsEngine] = None
         self._nifty_opt_sid: str = ""   # security_id of active option being tracked
+        self.sma_period:    int  = 1    # 1 = standard HA, N = Smoothed HA
         # Shared rate gate for ALL OHLC fetches across all polls
         import threading as _th
         self._ohlc_gate = _th.Lock()
@@ -1832,7 +1862,7 @@ class StrategyEngine:
             candles = agg.get_candles(include_current=False)
             if len(candles) < 2:
                 continue
-            ha      = compute_ha(candles)
+            ha      = compute_ha(candles, self.sma_period)
             last_ha = ha[-1]
             color   = ha_color(last_ha)
             bar_ts  = datetime.fromtimestamp(last_ha["bucket"]).strftime("%H:%M:%S")
@@ -1855,9 +1885,10 @@ class StrategyEngine:
             try:
                 self.nifty_engine.process(
                     self.client_id, self.access_token,
-                    "1", startup,   # pass "1" as interval for option chain logic
+                    "1", startup,
                     log_fn=self._log, lock=self.lock,
                     cached_spot_candles=_nifty_spot_candles or None,
+                    sma_period=self.sma_period,
                 )
             except Exception as e:
                 self._log(f"[NIFTY ENGINE ERROR] {e}")
@@ -1987,7 +2018,7 @@ class StrategyEngine:
                                          else "No data from Dhan" if len(candles) == 0
                                          else "Waiting for 2nd bar...")
                     else:
-                        ha      = compute_ha(candles)
+                        ha      = compute_ha(candles, self.sma_period)
                         last_ha = ha[-1]
                         color   = ha_color(last_ha)
                         ltp     = candles[-1]["close"]
@@ -2048,6 +2079,7 @@ class StrategyEngine:
                     log_fn=self._log,
                     lock=self.lock,
                     cached_spot_candles=_nifty_spot_candles if _nifty_spot_candles else None,
+                    sma_period=self.sma_period,
                 )
             except Exception as e:
                 self._log(f"[NIFTY ENGINE ERROR] {e}")
@@ -2130,7 +2162,7 @@ class StrategyEngine:
                     st.status = "Waiting for 2nd bar..."
             return
 
-        ha        = compute_ha(candles)
+        ha        = compute_ha(candles, self.sma_period)
         last_ha   = ha[-1]
         color     = ha_color(last_ha)
         ltp       = candles[-1]["close"]
@@ -2452,6 +2484,7 @@ class HATradingApp(ctk.CTk):
         self.crude_lots_var=ctk.IntVar(value=1)
         self.zinc_lots_var=ctk.IntVar(value=1)
         self.goldpetal_lots_var=ctk.IntVar(value=1)
+        self.sma_period_var=ctk.IntVar(value=1)
         self.nse_sq_var=ctk.StringVar(value="15:15")
         self.mcx_sq_var=ctk.StringVar(value="23:25")
         self.paper_var=ctk.BooleanVar(value=True)
@@ -2540,6 +2573,23 @@ class HATradingApp(ctk.CTk):
         for v,l in [("5s","5 Seconds (WS)"),("1","1 Minute"),("5","5 Minutes"),("15","15 Minutes")]:
             ctk.CTkRadioButton(tf,text=l,variable=self.interval_var,
                 value=v,font=ctk.CTkFont(size=12)).pack(anchor="w",padx=22,pady=5)
+
+        # ── SMA Period ────────────────────────────────────────────────────────
+        sma_card=ctk.CTkFrame(left_col,fg_color=C_CARD,corner_radius=8)
+        sma_card.pack(fill="x",padx=10,pady=6)
+        ctk.CTkLabel(sma_card,text="HA Smoothing (SMA Period)",
+            font=ctk.CTkFont(size=12,weight="bold"),text_color=C_ACCENT).pack(anchor="w",padx=12,pady=(8,2))
+        ctk.CTkLabel(sma_card,text="Period=1 → standard HA  |  Period=21 → smoothed HA",
+            font=ctk.CTkFont(size=10),text_color=C_GRAY).pack(anchor="w",padx=12,pady=(0,4))
+        sma_row=ctk.CTkFrame(sma_card,fg_color="transparent")
+        sma_row.pack(fill="x",padx=12,pady=(0,10))
+        ctk.CTkLabel(sma_row,text="SMA Period:",width=100,anchor="w",
+            font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkEntry(sma_row,textvariable=self.sma_period_var,
+            width=60,justify="center",
+            font=ctk.CTkFont(size=12)).pack(side="left",padx=6)
+        ctk.CTkLabel(sma_row,text="(1–200)",
+            font=ctk.CTkFont(size=10),text_color=C_GRAY).pack(side="left")
         qf=card(1,"Quantity per Trade")
         for l,v,u in [("NSE Stocks:",self.nse_qty_var,"shares"),
                       ("GOLDTEN:",self.gold_lots_var,"lots"),
@@ -2830,6 +2880,10 @@ class HATradingApp(ctk.CTk):
             paper_mode=paper)
         # ── Set 5s mode BEFORE wiring engines and starting ───────────────────
         self.engine._is_5s_mode = _is5s
+        # Apply SMA period — clamp to valid range
+        _sma_p = max(1, min(200, self.sma_period_var.get()))
+        self.engine.sma_period = _sma_p
+        self._log_bg(f"[HA] SMA period = {_sma_p} ({'standard HA' if _sma_p==1 else f'Smoothed HA({_sma_p})'})")
         if _is5s:
             for _st in self.instruments:
                 _ak = f"{_st.config.exchange_segment}:{_st.config.security_id}"

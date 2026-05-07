@@ -2574,22 +2574,17 @@ class HATradingApp(ctk.CTk):
             ctk.CTkRadioButton(tf,text=l,variable=self.interval_var,
                 value=v,font=ctk.CTkFont(size=12)).pack(anchor="w",padx=22,pady=5)
 
-        # ── SMA Period ────────────────────────────────────────────────────────
-        sma_card=ctk.CTkFrame(left_col,fg_color=C_CARD,corner_radius=8)
-        sma_card.pack(fill="x",padx=10,pady=6)
-        ctk.CTkLabel(sma_card,text="HA Smoothing (SMA Period)",
-            font=ctk.CTkFont(size=12,weight="bold"),text_color=C_ACCENT).pack(anchor="w",padx=12,pady=(8,2))
-        ctk.CTkLabel(sma_card,text="Period=1 → standard HA  |  Period=21 → smoothed HA",
-            font=ctk.CTkFont(size=10),text_color=C_GRAY).pack(anchor="w",padx=12,pady=(0,4))
-        sma_row=ctk.CTkFrame(sma_card,fg_color="transparent")
-        sma_row.pack(fill="x",padx=12,pady=(0,10))
-        ctk.CTkLabel(sma_row,text="SMA Period:",width=100,anchor="w",
-            font=ctk.CTkFont(size=12)).pack(side="left")
+        # ── SMA Period (inside same column as timeframe) ──────────────────────
+        ctk.CTkLabel(tf,text="HA Smoothing Period",
+            font=ctk.CTkFont(size=11,weight="bold"),text_color=C_GRAY).pack(anchor="w",padx=22,pady=(12,2))
+        ctk.CTkLabel(tf,text="1=standard HA, 21=smoothed HA",
+            font=ctk.CTkFont(size=10),text_color=C_GRAY).pack(anchor="w",padx=22)
+        sma_row=ctk.CTkFrame(tf,fg_color="transparent")
+        sma_row.pack(anchor="w",padx=22,pady=(4,10))
         ctk.CTkEntry(sma_row,textvariable=self.sma_period_var,
-            width=60,justify="center",
-            font=ctk.CTkFont(size=12)).pack(side="left",padx=6)
-        ctk.CTkLabel(sma_row,text="(1–200)",
-            font=ctk.CTkFont(size=10),text_color=C_GRAY).pack(side="left")
+            width=60,justify="center",font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkLabel(sma_row,text=" period",
+            font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(side="left")
         qf=card(1,"Quantity per Trade")
         for l,v,u in [("NSE Stocks:",self.nse_qty_var,"shares"),
                       ("GOLDTEN:",self.gold_lots_var,"lots"),

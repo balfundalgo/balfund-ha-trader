@@ -2630,14 +2630,13 @@ class HATradingApp(ctk.CTk):
             font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(side="left")
         qf=card(1,"Quantity per Trade")
         # Default NSE qty (applied when stock has no override)
-        ctk.CTkLabel(qty,text="Default NSE Qty (new stocks):",
+        ctk.CTkLabel(qf,text="Default NSE Qty (new stocks):",
             font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(anchor="w",padx=12,pady=(4,0))
-        _dq_row=ctk.CTkFrame(qty,fg_color="transparent"); _dq_row.pack(anchor="w",padx=12,pady=(2,6))
+        _dq_row=ctk.CTkFrame(qf,fg_color="transparent"); _dq_row.pack(anchor="w",padx=12,pady=(2,6))
         ctk.CTkEntry(_dq_row,textvariable=self.nse_qty_var,width=60,justify="center",
             font=ctk.CTkFont(size=12)).pack(side="left")
         ctk.CTkLabel(_dq_row,text=" shares",font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(side="left")
         for l,v,u in [("GOLDTEN:",self.gold_lots_var,"lots"),
-                      ("GOLDTEN:",self.gold_lots_var,"lots"),
                       ("SILVERMICRO:",self.silv_lots_var,"lots"),
                       ("CRUDEOILM:",self.crude_lots_var,"lots"),
                       ("ZINCMINI:",self.zinc_lots_var,"lots"),

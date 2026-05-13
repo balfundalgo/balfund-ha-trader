@@ -338,12 +338,48 @@ MCX_LOT_MULTIPLIERS: Dict[str, int] = {
 #  NSE STOCK UNIVERSE  (21 stocks from big_boom.xls)
 # ─────────────────────────────────────────────────────────────────────────────
 NSE_STOCKS = [
-    "ULTRACEMCO", "DIXON",      "APARINDS",  "BAJAJHLDNG", "BAJAJ-AUTO",
-    "GILLETTE",   "APOLLOHOSP", "LINDEINDIA","OFSS",        "POLYCAB",
-    "CRAFTSMAN",  "EICHERMOT",  "ATUL",      "AMBER",       "ABB",
-    "NAVINFLUOR", "DIVISLAB",   "BRITANNIA", "ALKEM",       "PERSISTENT",
-    "JKCEMENT",
+    "GMRAIRPORT","IRFC",      "DBREALTY",  "DEVYANI",   "VMM",
+    "IREDA",     "WELSPUNLIV","PNB",        "JMFINANCIL","J&KBANK",
+    "IEX",       "JSWCEMENT", "MOTHERSON", "RCF",       "NIACL",
+    "ADANIPOWER","IRCON",     "CANBK",     "SAMMAANCAP","NCC",
+    "GAIL",      "SAIL",      "PPLPHARMA", "CESC",      "BANKINDIA",
+    "IGL",       "IOC",       "ITCHOTELS", "CGCL",      "JINDALSAW",
+    "SAPPHIRE",  "AWL",       "HUDCO",     "BANDHANBNK","CASTROLIND",
+    "FINPIPE",   "UNIONBANK", "ASHOKLEY",  "AEGISVOPAK","MRPL",
+    "TATASTEEL", "ENGINERSIN","WIPRO",     "RITES",     "FSL",
+    "FIRSTCRY",  "ACMESOLAR", "ANGELONE",  "ETERNAL",   "APTUS",
+    "JIOFIN",    "CAMPUS",    "JYOTHYLAB", "SCI",       "NLCINDIA",
+    "CROMPTON",  "SONATSOFTW","BLS",       "GPIL",      "CUB",
+    "ITI",       "BHEL",      "NYKAA",     "REDINGTON", "MANAPPURAM",
+    "JSWINFRA",  "ONGC",      "LTF",       "PCBL",      "AFCONS",
+    "FEDERALBNK","GSPL",      "RVNL",      "JWL",       "RAILTEL",
+    "TARIL",     "NUVOCO",    "PETRONET",  "HONASA",    "COHANCE",
+    "BANKBARODA","SWIGGY",    "POWERGRID", "LATENTVIEW","KARURVYSYA",
+    "RBLBANK",   "ITC",       "PRAJIND",   "EXIDEIND",  "EIHOTEL",
+    "VGUARD",    "BPCL",      "SAREGAMA",  "IGIL",      "ABCAPITAL",
+    "GODIGIT",   "RECLTD",    "TMPV",      "SWANCORP",  "M&MFIN",
+    "MANYAVAR",  "GICRE",     "INDIACEM",  "TRIVENI",   "GUJGASLTD",
+    "BLUEJET",   "NTPC",      "LTFOODS",   "TATAPOWER", "RHIM",
+    "BSOFT",     "HINDPETRO", "NATIONALUM","FIVESTAR",  "KALYANKJIL",
+    "SUMICHEM",  "KOTAKBANK", "BIOCON",    "HAPPSTMNDS","ELECON",
+    "SYNGENE",   "PFC",       "USHAMART",  "POONAWALLA","DELHIVERY",
+    "AARTIIND",  "THELEELA",  "CHAMBLFERT","APOLLOTYRE","VBL",
+    "BERGEPAINT","HEXT",      "COALINDIA", "EMAMILTD",  "HSCL",
+    "JKTYRE",    "INDUSTOWER","AGARWALEYE","TEJASNET",  "STARHEALTH",
+    "INDGN",     "BEL",       "AMBUJACEM", "NEWGEN",    "TRITURBINE",
+    "CONCOR",    "ATGL",      "OIL",       "DABUR",     "AADHARHFC",
+    "ANANTRAJ",  "JUBLFOOD",  "AIIL",      "JSWENERGY", "IIFL",
+    "PATANJALI", "AKUMS",     "BALRAMCHIN","MINDACORP", "SONACOMS",
+    "LICHSGFIN", "JBMA",      "HEG",       "ELGIEQUIP", "KEC",
+    "VTL",       "GMDCLTD",   "MAHSEAMLES","IRCTC",     "SARDAEN",
+    "RKFORGE",   "ZENSARTECH","JUBLINGREA",
 ]
+
+# Alias map for symbols with special characters or alternate names in Dhan CSV
+NSE_SYMBOL_ALIAS = {
+    "J&KBANK":  "J&KBANK",   # verified in Dhan CSV
+    "M&MFIN":   "M&MFIN",    # verified in Dhan CSV
+}
 MCX_SYMBOLS = ["GOLDTEN", "SILVERMICRO"]
 
 NSE_SESSION_START = "09:15"
@@ -680,6 +716,8 @@ def load_master_csv() -> List[Dict[str, str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_nse_stocks(rows: List[Dict[str, str]], symbols: List[str]) -> Dict[str, str]:
+    # Apply alias map for symbols with special chars or alternate Dhan names
+    _alias = NSE_SYMBOL_ALIAS if "NSE_SYMBOL_ALIAS" in globals() else {}
     """One-pass index build → O(n) total, not O(n × m)."""
     _gui_log("  Building NSE_EQ index ...")
     index: Dict[str, str] = {}
@@ -1015,16 +1053,24 @@ class MultiTickerWS:
             except Exception: pass
 
     def _on_open(self, ws):
-        sub = {
-            "RequestCode":     REQ_SUB_TICKER,
-            "InstrumentCount": len(self.instruments),
-            "InstrumentList": [
-                {"ExchangeSegment": seg, "SecurityId": sid}
-                for sid, seg in self.instruments
-            ],
-        }
-        ws.send(json.dumps(sub))
-        self._status(f"WS connected — subscribed {len(self.instruments)} instruments")
+        # Dhan WS: subscribe in batches of 100 (API limit per message)
+        BATCH = 100
+        instruments = self.instruments
+        total = len(instruments)
+        for i in range(0, total, BATCH):
+            batch = instruments[i:i+BATCH]
+            sub = {
+                "RequestCode":     REQ_SUB_TICKER,
+                "InstrumentCount": len(batch),
+                "InstrumentList": [
+                    {"ExchangeSegment": seg, "SecurityId": sid}
+                    for sid, seg in batch
+                ],
+            }
+            ws.send(json.dumps(sub))
+            if i + BATCH < total:
+                time.sleep(0.1)   # 100ms between batches
+        self._status(f"WS connected — subscribed {total} instruments")
 
     def _on_message(self, ws, message):
         try:
@@ -1158,23 +1204,21 @@ class MultiTickerWS:
             with self.lock:
                 st.last_ltp     = round(ltp, 2)
                 st.last_tick_ts = now   # ← track tick time for WS health display
-            # Feed 5s aggregator
-            if self._is_5s_mode:
-                agg_key = seg_key or security_id
-                agg = self._aggregators.get(agg_key)
-                if agg:
-                    agg.on_tick(ltp, now)
+            # Feed aggregator for all WS-based candles (all timeframes)
+            agg_key = seg_key or security_id
+            agg = self._aggregators.get(agg_key)
+            if agg:
+                agg.on_tick(ltp, now)
             self.ws_ticks += 1
             return
         # NIFTY spot tick
         if security_id == NIFTY_SPOT_SID and self.nifty_state:
             with self.lock:
                 self.nifty_state.spot_ltp = round(ltp, 2)
-            if self._is_5s_mode:
-                agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
-                agg = self._aggregators.get(agg_key)
-                if agg:
-                    agg.on_tick(ltp, time.time())
+            agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
+            agg = self._aggregators.get(agg_key)
+            if agg:
+                agg.on_tick(ltp, time.time())
             self.ws_ticks += 1
             return
         # NIFTY option tick
@@ -1700,23 +1744,21 @@ class StrategyEngine:
             with self.lock:
                 st.last_ltp     = round(ltp, 2)
                 st.last_tick_ts = now   # ← track tick time for WS health display
-            # Feed 5s aggregator
-            if self._is_5s_mode:
-                agg_key = seg_key or security_id
-                agg = self._aggregators.get(agg_key)
-                if agg:
-                    agg.on_tick(ltp, now)
+            # Feed aggregator for all WS-based candles (all timeframes)
+            agg_key = seg_key or security_id
+            agg = self._aggregators.get(agg_key)
+            if agg:
+                agg.on_tick(ltp, now)
             self.ws_ticks += 1
             return
         # NIFTY spot tick
         if security_id == NIFTY_SPOT_SID and self.nifty_state:
             with self.lock:
                 self.nifty_state.spot_ltp = round(ltp, 2)
-            if self._is_5s_mode:
-                agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
-                agg = self._aggregators.get(agg_key)
-                if agg:
-                    agg.on_tick(ltp, time.time())
+            agg_key = f"{NIFTY_SPOT_SEG}:{NIFTY_SPOT_SID}"
+            agg = self._aggregators.get(agg_key)
+            if agg:
+                agg.on_tick(ltp, time.time())
             self.ws_ticks += 1
             return
         # NIFTY option tick
@@ -1754,41 +1796,43 @@ class StrategyEngine:
     # ── Main loop ─────────────────────────────────────────────
 
     def _run(self):
+        """Unified WS-driven loop for ALL timeframes (5s / 1m / 5m / 15m).
+        Seed candles once from REST at startup, then build from live ticks only.
+        """
         self._log("Engine started")
-        if self._is_5s_mode:
-            self._run_5s()
-        else:
-            self._run_rest()
+        iv_sec = self._interval_sec()
+        n_inst = len(self.instruments) + 1
+        est    = max(1, int(n_inst / 5) + 5)
+        self._log(f"[WS] Seeding {n_inst} instruments via REST (~{est}s one-time)...")
+        self._init_aggregators(iv_sec)
+        self._log(f"[WS] Seed done — live candles from WebSocket ticks ({self.interval}{'s' if self._is_5s_mode else 'm'} timeframe)")
+        self._process_ws_signals(startup=True)
+        self._set_next_ws_boundary(iv_sec)
+        while not self._stop.is_set():
+            self._wait_ws_boundary(iv_sec)
+            if self._stop.is_set(): break
+            self._check_auto_squareoff()
+            self._process_ws_signals(startup=False)
+            self._set_next_ws_boundary(iv_sec)
         self._log("Engine stopped")
 
-    def _run_rest(self):
-        """Standard REST-polling loop (1m/5m/15m timeframes)."""
-        self._poll_all(startup=True)
-        self._set_next_poll()
-        while not self._stop.is_set():
-            self._wait_for_next_poll()
-            if self._stop.is_set(): break
-            self._check_auto_squareoff()
-            self._poll_all(startup=False)
-            self._set_next_poll()
+    def _interval_sec(self) -> int:
+        """Convert interval string to seconds."""
+        if self._is_5s_mode or self.interval == "5s":
+            return 5
+        try:
+            return int(self.interval) * 60
+        except Exception:
+            return 60   # fallback to 1 minute
 
-    def _run_5s(self):
-        """5-second WS-driven loop — builds candles from live ticks."""
-        # ── Seed aggregators with historical 1-min REST data ─────────────────
-        self._log("[5s] Seeding aggregators from REST history...")
-        self._init_5s_aggregators()
-        self._log("[5s] Aggregators ready — running on WS ticks")
+    def _set_next_ws_boundary(self, iv_sec: int):
+        next_b = (int(time.time()) // iv_sec + 1) * iv_sec
+        self.next_poll_at = datetime.fromtimestamp(next_b).strftime("%H:%M:%S")
 
-        # ── Startup: fire initial signals from seeded data ───────────────────
-        self._process_5s_signals(startup=True)
-        self._set_next_poll_5s()
-
-        while not self._stop.is_set():
-            self._wait_for_5s_boundary()
-            if self._stop.is_set(): break
-            self._check_auto_squareoff()
-            self._process_5s_signals(startup=False)
-            self._set_next_poll_5s()
+    def _wait_ws_boundary(self, iv_sec: int):
+        next_b = (int(time.time()) // iv_sec + 1) * iv_sec
+        while time.time() < next_b and not self._stop.is_set():
+            time.sleep(0.05)
 
     def _init_5s_aggregators(self):
         """Fetch 1-min REST candles for each instrument and seed aggregators."""
@@ -1829,8 +1873,8 @@ class StrategyEngine:
         while time.time() < next_5 and not self._stop.is_set():
             time.sleep(0.05)   # 50ms precision
 
-    def _process_5s_signals(self, startup: bool):
-        """Compute HA from WS-aggregated candles and fire orders."""
+    def _process_ws_signals(self, startup: bool):
+        """Compute HA from WS-aggregated candles and fire orders (all timeframes)."""
         signals: Dict[str, Optional[str]] = {}
         _nifty_spot_candles: list = []
 
@@ -1956,11 +2000,8 @@ class StrategyEngine:
     # ── Poll ──────────────────────────────────────────────────
 
     def _poll_all(self, startup: bool = False):
-        """
-        Sequential poll — MCX → NIFTY spot → NSE stocks.
-        Every 5 requests sleep 1s (Dhan Data API: 5 req/sec limit).
-        Orders fire sequentially with 120ms gap (Dhan Order API: 10/sec).
-        """
+        """DEPRECATED: REST polling replaced by WS-based _process_ws_signals."""
+        return  # no-op
 
         # ── Step 1: Fetch OHLC for all instruments in parallel ────────────────
         # Mark closed instruments
@@ -2479,6 +2520,8 @@ class HATradingApp(ctk.CTk):
         self._client_id=""; self._access_token=""
         self.interval_var=ctk.StringVar(value="5")
         self.nse_qty_var=ctk.IntVar(value=10)
+        # Per-stock qty vars — initialized lazily when instruments are resolved
+        self._stock_qty_vars: Dict[str, ctk.IntVar] = {}
         self.gold_lots_var=ctk.IntVar(value=1)
         self.silv_lots_var=ctk.IntVar(value=1)
         self.crude_lots_var=ctk.IntVar(value=1)
@@ -2586,7 +2629,14 @@ class HATradingApp(ctk.CTk):
         ctk.CTkLabel(sma_row,text=" period",
             font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(side="left")
         qf=card(1,"Quantity per Trade")
-        for l,v,u in [("NSE Stocks:",self.nse_qty_var,"shares"),
+        # Default NSE qty (applied when stock has no override)
+        ctk.CTkLabel(qty,text="Default NSE Qty (new stocks):",
+            font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(anchor="w",padx=12,pady=(4,0))
+        _dq_row=ctk.CTkFrame(qty,fg_color="transparent"); _dq_row.pack(anchor="w",padx=12,pady=(2,6))
+        ctk.CTkEntry(_dq_row,textvariable=self.nse_qty_var,width=60,justify="center",
+            font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkLabel(_dq_row,text=" shares",font=ctk.CTkFont(size=11),text_color=C_GRAY).pack(side="left")
+        for l,v,u in [("GOLDTEN:",self.gold_lots_var,"lots"),
                       ("GOLDTEN:",self.gold_lots_var,"lots"),
                       ("SILVERMICRO:",self.silv_lots_var,"lots"),
                       ("CRUDEOILM:",self.crude_lots_var,"lots"),
@@ -2703,7 +2753,8 @@ class HATradingApp(ctk.CTk):
             bg = C_ROW_A if row_counter[0] % 2 == 0 else C_ROW_B
             row = InstrumentRow(self.scroll, row_counter[0] + 1, st, bg,
                 on_check=lambda s, c: setattr(s, "skip", not c),
-                on_click=self._select_row)
+                on_click=self._select_row,
+                qty_var=self._stock_qty_vars.get(st.config.name))
             self._rows.append(row)
             row_counter[0] += 1
 
@@ -2714,7 +2765,8 @@ class HATradingApp(ctk.CTk):
             bg = C_ROW_A if row_counter[0] % 2 == 0 else C_ROW_B
             row = InstrumentRow(self.scroll, row_counter[0] + 1, st, bg,
                 on_check=lambda s, c: setattr(s, "skip", not c),
-                on_click=self._select_row)
+                on_click=self._select_row,
+                qty_var=self._stock_qty_vars.get(st.config.name))
             self._rows.append(row)
             row_counter[0] += 1
 
@@ -2834,14 +2886,16 @@ class HATradingApp(ctk.CTk):
                     api_qty=lv.get()))  # order qty = number of lots only
             self._log_bg("[4/4] Resolving NSE stocks...")
             nse_ids=resolve_nse_stocks(rows,NSE_STOCKS)
-            nq=self.nse_qty_var.get()
+            default_qty = self.nse_qty_var.get()
             for sym in NSE_STOCKS:
                 sid=nse_ids.get(sym)
                 if not sid: continue
+                if sym not in self._stock_qty_vars:
+                    self._stock_qty_vars[sym]=ctk.IntVar(value=default_qty)
                 instruments.append(InstrumentState(
                     config=InstrumentConfig(name=sym,exchange_segment="NSE_EQ",
                         security_id=sid,product_type="INTRADAY",lot_multiplier=1),
-                    api_qty=nq))
+                    api_qty=self._stock_qty_vars[sym].get()))
             self._log_bg(f"      {len(instruments)} instruments ready.")
             if not instruments:
                 self.after(0,lambda:self._on_start_error("No instruments resolved.")); return
@@ -2936,9 +2990,16 @@ class HATradingApp(ctk.CTk):
                 self.sum_lbl.configure(
                     text=f"{longs} LONG   {shorts} SHORT   "
                          f"{active}/{len(self.instruments)} active   "
-                         f"Next poll: {self.engine.next_poll_at if not self.engine._is_5s_mode else '5s boundary'}   "
+                         f"Next candle: {self.engine.next_poll_at}   "
                          f"{'WS: ✓ LIVE' if self.engine.ws_status.startswith('WS connected') else 'WS: ✕ ' + self.engine.ws_status[:20]}")
-                nq=self.nse_qty_var.get(); gl=self.gold_lots_var.get(); sl=self.silv_lots_var.get()
+                gl=self.gold_lots_var.get(); sl=self.silv_lots_var.get()
+                # Sync per-stock qty from editable vars to InstrumentState
+                for st in self.instruments:
+                    if not st.config.is_mcx and st.config.name in self._stock_qty_vars:
+                        new_q = self._stock_qty_vars[st.config.name].get()
+                        if new_q > 0 and new_q != st.api_qty:
+                            st.api_qty = new_q
+                nq=self.nse_qty_var.get()
                 for row in self._rows: row.update(nq,gl,sl,self.crude_lots_var.get(),self.zinc_lots_var.get())
                 # Update NIFTY row
                 if self.nifty_state and hasattr(self, "_nifty_labels"):

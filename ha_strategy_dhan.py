@@ -272,8 +272,9 @@ def load_master(log_fn=print) -> List[dict]:
         cache_age = (time.time() - MASTER_CACHE.stat().st_mtime) / 3600
         if cache_age < 12:
             log_fn(f"  ✓ Using cached master CSV ({cache_age:.1f}h old)")
-            with open(MASTER_CACHE, encoding="utf-8", errors="ignore") as f:
-                return list(csv.DictReader(f))
+            raw = MASTER_CACHE.read_text(encoding="utf-8", errors="ignore")
+            if raw.startswith("﻿"): raw = raw[1:]
+            return list(csv.DictReader(io.StringIO(raw)))
     log_fn("  Downloading Dhan master CSV...")
     r = requests.get(MASTER_CSV_URL, stream=True, timeout=120)
     r.raise_for_status()
@@ -289,21 +290,29 @@ def load_master(log_fn=print) -> List[dict]:
             if milestone > last_pct:
                 log_fn(f"    {done/1e6:.1f} MB / {total/1e6:.1f} MB  ({milestone}%)")
                 last_pct = milestone
-    buf.seek(0)
-    raw = buf.read().decode("utf-8", errors="ignore")
+    # Force UTF-8 decode + strip BOM (prevents NSE section being missed)
+    raw = buf.getvalue().decode("utf-8", errors="ignore")
+    if raw.startswith("﻿"): raw = raw[1:]
     MASTER_CACHE.write_text(raw, encoding="utf-8")
     return list(csv.DictReader(io.StringIO(raw)))
 
 def _build_nse_index(rows: List[dict]) -> Dict[str, str]:
-    """Build {SYMBOL → sid} index once. Called once per master CSV load."""
+    """Build {TICKER → sid} using SEM_TRADING_SYMBOL (e.g. INFY-EQ → INFY)."""
+    import re as _re
     idx = {}
     for row in rows:
-        if (row.get("SEM_EXM_EXCH_ID","").strip().upper() == "NSE" and
-            row.get("SEM_INSTRUMENT_NAME","").strip().upper() == "EQ"):
-            sym = row.get("SEM_CUSTOM_SYMBOL","").strip().upper()
-            sid = row.get("SEM_SMST_SECURITY_ID","").strip()
-            if sym and sid:
-                idx[sym] = sid
+        exch   = row.get("SEM_EXM_EXCH_ID","").strip().upper()
+        series = row.get("SEM_SERIES","").strip().upper()
+        ts     = row.get("SEM_TRADING_SYMBOL","").strip().upper()
+        sid    = row.get("SEM_SMST_SECURITY_ID","").strip()
+        if exch != "NSE": continue
+        if series not in ("EQ","BE","BZ","IL","SM"): continue
+        if not ts or not sid: continue
+        ticker = _re.sub(r"-(EQ|BE|BZ|IL|SM)$", "", ts).strip()
+        if ticker and series == "EQ":
+            idx[ticker] = sid
+        elif ticker and ticker not in idx:
+            idx[ticker] = sid
     return idx
 
 def resolve_nse(rows: List[dict], sym: str) -> Optional[str]:

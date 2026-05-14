@@ -40,7 +40,7 @@ TD   = "#6B7280"           # dim text
 BD   = "#D1D5DB"           # borders
 ROW_A = "#FFFFFF"
 ROW_B = "#F8FAFC"
-FONT  = ("Segoe UI", 11)
+FONT  = ("Segoe UI", 11, "bold")
 FONTB = ("Segoe UI", 11, "bold")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -280,21 +280,36 @@ def load_master(log_fn=print) -> List[dict]:
     total = int(r.headers.get("content-length", 0))
     buf = io.BytesIO()
     done = 0
+    last_pct = -1
     for chunk in r.iter_content(65536):
         buf.write(chunk); done += len(chunk)
-        if total: log_fn(f"    {done/1e6:.1f} MB / {total/1e6:.1f} MB  ({done*100//total}%)")
+        if total:
+            pct = done * 100 // total
+            milestone = (pct // 10) * 10
+            if milestone > last_pct:
+                log_fn(f"    {done/1e6:.1f} MB / {total/1e6:.1f} MB  ({milestone}%)")
+                last_pct = milestone
     buf.seek(0)
     raw = buf.read().decode("utf-8", errors="ignore")
     MASTER_CACHE.write_text(raw, encoding="utf-8")
     return list(csv.DictReader(io.StringIO(raw)))
 
-def resolve_nse(rows: List[dict], sym: str) -> Optional[str]:
+def _build_nse_index(rows: List[dict]) -> Dict[str, str]:
+    """Build {SYMBOL → sid} index once. Called once per master CSV load."""
+    idx = {}
     for row in rows:
         if (row.get("SEM_EXM_EXCH_ID","").strip().upper() == "NSE" and
-            row.get("SEM_INSTRUMENT_NAME","").strip().upper() == "EQ" and
-            row.get("SEM_CUSTOM_SYMBOL","").strip().upper() == sym.upper()):
-            return row.get("SEM_SMST_SECURITY_ID","").strip()
-    return None
+            row.get("SEM_INSTRUMENT_NAME","").strip().upper() == "EQ"):
+            sym = row.get("SEM_CUSTOM_SYMBOL","").strip().upper()
+            sid = row.get("SEM_SMST_SECURITY_ID","").strip()
+            if sym and sid:
+                idx[sym] = sid
+    return idx
+
+def resolve_nse(rows: List[dict], sym: str) -> Optional[str]:
+    # Legacy single-lookup (slow) — use _build_nse_index for bulk
+    idx = _build_nse_index(rows)
+    return idx.get(sym.upper())
 
 def resolve_mcx(rows: List[dict], sym: str, log_fn=print) -> Optional[dict]:
     import re
@@ -1188,7 +1203,7 @@ class App(ctk.CTk):
             fg_color=BD, text_color=TX, hover_color="#E5E7EB",
             command=lambda: self._log_box.delete("1.0","end")).pack(
             side="right", padx=6, pady=4)
-        self._log_box = ctk.CTkTextbox(parent, font=("Consolas",11),
+        self._log_box = ctk.CTkTextbox(parent, font=("Consolas",11,"bold"),
             fg_color=CARD, text_color=TX, border_width=1, border_color=BD)
         self._log_box.pack(fill="both", expand=True, padx=6, pady=(2,6))
 
@@ -1272,19 +1287,26 @@ class App(ctk.CTk):
                              expiry=m["expiry"]),
                 qty=lv.get()))
 
-        # NSE
-        self._log("  Resolving NSE stocks...")
+        # NSE — build index once, then O(1) lookups
+        self._log("  Building NSE index...")
+        nse_idx = _build_nse_index(rows)
+        self._log(f"  NSE index built — {len(nse_idx)} symbols")
+        found, missing = 0, []
         for sym in NSE_STOCKS:
-            sid = resolve_nse(rows, sym)
+            sid = nse_idx.get(sym.upper())
             if not sid:
-                self._log(f"  ✗ {sym} not found in master CSV")
+                missing.append(sym)
                 continue
             if sym not in self._stock_qty_vars:
                 self._stock_qty_vars[sym] = ctk.IntVar(value=default_qty)
             instruments.append(InstrState(
                 cfg=InstrCfg(name=sym, seg="NSE_EQ", sid=sid),
                 qty=self._stock_qty_vars[sym].get()))
-            self._log(f"  ✓ {sym:<14} sid={sid}")
+            found += 1
+        self._log(f"  ✓ {found} NSE stocks resolved")
+        if missing:
+            self._log(f"  ✗ Not found ({len(missing)}): {', '.join(missing[:10])}"
+                      + (f"... +{len(missing)-10} more" if len(missing)>10 else ""))
 
         self._log(f"  {len(instruments)} instruments ready.")
         return instruments

@@ -19,6 +19,7 @@ from tkinter import ttk
 BASE_DIR          = Path(sys.executable).parent if getattr(sys,"frozen",False) else Path(__file__).parent
 SHARED_TOKEN_FILE = Path(r"C:\balfund_shared\dhan_token.json")
 MASTER_CACHE      = BASE_DIR / "dhan_master_cache.csv"
+SETTINGS_FILE     = BASE_DIR / "balfund_settings.json"
 MASTER_URL        = "https://images.dhan.co/api-data/api-scrip-master.csv"
 INTRADAY_URL      = "https://api.dhan.co/v2/charts/intraday"
 OC_EXPIRY_URL     = "https://api.dhan.co/v2/optionchain/expirylist"
@@ -456,19 +457,58 @@ class App(ctk.CTk):
         self._running=False
         self._log_q:queue.Queue=queue.Queue()
         self._stock_qty_vars:Dict[str,ctk.IntVar]={}
+        # Load saved settings (or defaults)
+        _s = self._load_settings()
         # Settings vars
-        self.tf_var=ctk.StringVar(value="1")
-        self.sma_var=ctk.IntVar(value=1)
-        self.paper_var=ctk.BooleanVar(value=True)
-        self.nse_sq_var=ctk.StringVar(value="15:15")
-        self.mcx_sq_var=ctk.StringVar(value="23:25")
-        self.gold_v=ctk.IntVar(value=1); self.silv_v=ctk.IntVar(value=1)
-        self.crude_v=ctk.IntVar(value=1); self.zinc_v=ctk.IntVar(value=1)
-        self.gp_v=ctk.IntVar(value=1)
-        self.default_qty_v=ctk.IntVar(value=1)
+        self.tf_var=ctk.StringVar(value=_s.get("tf","1"))
+        self.sma_var=ctk.IntVar(value=_s.get("sma",1))
+        self.paper_var=ctk.BooleanVar(value=_s.get("paper",True))
+        self.nse_sq_var=ctk.StringVar(value=_s.get("nse_sq","15:15"))
+        self.mcx_sq_var=ctk.StringVar(value=_s.get("mcx_sq","23:25"))
+        self.gold_v=ctk.IntVar(value=_s.get("gold",1))
+        self.silv_v=ctk.IntVar(value=_s.get("silv",1))
+        self.crude_v=ctk.IntVar(value=_s.get("crude",1))
+        self.zinc_v=ctk.IntVar(value=_s.get("zinc",1))
+        self.gp_v=ctk.IntVar(value=_s.get("gp",1))
+        self.default_qty_v=ctk.IntVar(value=_s.get("default_qty",1))
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._preload)
         self.after(400, self._tick)
+
+    def _on_close(self):
+        self._save_settings()
+        self.destroy()
+
+    # ── Settings persistence ────────────────────────────────────────────────
+    def _load_settings(self) -> dict:
+        try:
+            if SETTINGS_FILE.exists():
+                return json.loads(SETTINGS_FILE.read_text())
+        except Exception: pass
+        return {}
+
+    def _save_settings(self):
+        try:
+            data = {
+                "tf":          self.tf_var.get(),
+                "sma":         self.sma_var.get(),
+                "paper":       self.paper_var.get(),
+                "nse_sq":      self.nse_sq_var.get(),
+                "mcx_sq":      self.mcx_sq_var.get(),
+                "gold":        self.gold_v.get(),
+                "silv":        self.silv_v.get(),
+                "crude":       self.crude_v.get(),
+                "zinc":        self.zinc_v.get(),
+                "gp":          self.gp_v.get(),
+                "default_qty": self.default_qty_v.get(),
+            }
+            # Also save per-stock NSE qtys
+            stock_qtys = {sym: var.get() for sym, var in self._stock_qty_vars.items()}
+            data["stock_qtys"] = stock_qtys
+            SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            pass   # silently ignore save errors
 
     # ── Build ────────────────────────────────────────────────────────────────
     def _build(self):
@@ -575,6 +615,11 @@ class App(ctk.CTk):
             fg_color="#374151",hover_color="#111827",
             command=lambda:threading.Thread(target=self.engine.sq_all,daemon=True).start()
             if self.engine else None,height=30).pack(fill="x",padx=12,pady=4)
+        ctk.CTkButton(cf,text="💾  Save Settings",font=FONT,
+            fg_color=ACL,hover_color=AC,
+            command=lambda:(self._save_settings(),
+                self._set_status("✓ Settings saved",GR)),
+            height=30).pack(fill="x",padx=12,pady=4)
 
     def _build_live(self,parent):
         parent.configure(fg_color=BG)
@@ -694,6 +739,11 @@ class App(ctk.CTk):
 
     def _on_preloaded(self,insts):
         self.instruments=insts
+        # Restore saved per-stock qtys
+        saved = self._load_settings().get("stock_qtys", {})
+        for sym, var in self._stock_qty_vars.items():
+            if sym in saved:
+                var.set(saved[sym])
         self._populate_tree()
         self._nb.set("Live Strategy")
         self._set_status(f"{len(insts)} instruments loaded — ready to START",GR)
@@ -722,9 +772,21 @@ class App(ctk.CTk):
         tf=self.tf_var.get()
         iv=5 if tf=="5s" else int(tf)*60
         sma=max(1,self.sma_var.get())
+        # Sync NSE qty from per-stock vars
         for st in self.instruments:
             if not st.is_mcx and st.name in self._stock_qty_vars:
                 st.qty=self._stock_qty_vars[st.name].get()
+        # Sync MCX lots from settings vars (in case changed after preload)
+        mcx_qty_map={
+            "GOLDTEN":    self.gold_v.get(),
+            "SILVERMICRO":self.silv_v.get(),
+            "CRUDEOILM":  self.crude_v.get(),
+            "ZINCMINI":   self.zinc_v.get(),
+            "GOLDPETAL":  self.gp_v.get(),
+        }
+        for st in self.instruments:
+            if st.is_mcx and st.name in mcx_qty_map:
+                st.qty=mcx_qty_map[st.name]
         self.engine=Engine(cid,tok,self.instruments,iv,sma,
             self.paper_var.get(),self.nse_sq_var.get(),self.mcx_sq_var.get(),
             log_fn=self._log)
@@ -737,6 +799,7 @@ class App(ctk.CTk):
             text_color="#FDE68A" if mode=="PAPER" else RD)
         tf_d=tf if tf=="5s" else f"{tf}m"
         self._set_status(f"Running | {tf_d}(WS) | {len(self.instruments)} insts | {mode}",GR)
+        self._save_settings()   # persist current settings
         self._nb.set("Live Strategy")
 
     def _stop(self):

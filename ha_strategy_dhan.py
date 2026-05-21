@@ -503,9 +503,7 @@ class App(ctk.CTk):
                 "gp":          self.gp_v.get(),
                 "default_qty": self.default_qty_v.get(),
             }
-            # Also save per-stock NSE qtys
-            stock_qtys = {sym: var.get() for sym, var in self._stock_qty_vars.items()}
-            data["stock_qtys"] = stock_qtys
+            # stock_qtys removed — default_qty_v covers all NSE stocks uniformly
             SETTINGS_FILE.write_text(json.dumps(data, indent=2))
         except Exception as e:
             pass   # silently ignore save errors
@@ -739,11 +737,8 @@ class App(ctk.CTk):
 
     def _on_preloaded(self,insts):
         self.instruments=insts
-        # Restore saved per-stock qtys
-        saved = self._load_settings().get("stock_qtys", {})
-        for sym, var in self._stock_qty_vars.items():
-            if sym in saved:
-                var.set(saved[sym])
+        # Don't restore per-stock qtys — default_qty_v is the single source of truth
+        # (per-stock overrides removed in v3.0 since treeview has no editable cells)
         self._populate_tree()
         self._nb.set("Live Strategy")
         self._set_status(f"{len(insts)} instruments loaded — ready to START",GR)
@@ -772,12 +767,9 @@ class App(ctk.CTk):
         tf=self.tf_var.get()
         iv=5 if tf=="5s" else int(tf)*60
         sma=max(1,self.sma_var.get())
-        # Sync NSE qty from per-stock vars
-        for st in self.instruments:
-            if not st.is_mcx and st.name in self._stock_qty_vars:
-                st.qty=self._stock_qty_vars[st.name].get()
-        # Sync MCX lots from settings vars (in case changed after preload)
-        mcx_qty_map={
+        # Sync qty — always read CURRENT values from UI fields
+        nse_qty = self.default_qty_v.get()   # single source of truth for all NSE
+        mcx_qty_map = {
             "GOLDTEN":    self.gold_v.get(),
             "SILVERMICRO":self.silv_v.get(),
             "CRUDEOILM":  self.crude_v.get(),
@@ -785,8 +777,11 @@ class App(ctk.CTk):
             "GOLDPETAL":  self.gp_v.get(),
         }
         for st in self.instruments:
-            if st.is_mcx and st.name in mcx_qty_map:
-                st.qty=mcx_qty_map[st.name]
+            if st.is_mcx:
+                st.qty = mcx_qty_map.get(st.name, st.qty)
+            else:
+                st.qty = nse_qty
+        self._log(f"[START] NSE qty={nse_qty}  MCX: {mcx_qty_map}")
         self.engine=Engine(cid,tok,self.instruments,iv,sma,
             self.paper_var.get(),self.nse_sq_var.get(),self.mcx_sq_var.get(),
             log_fn=self._log)

@@ -29,35 +29,46 @@ WS_URL            = "wss://api-feed.dhan.co?version=2&token={tok}&clientId={cid}
 NIFTY_SID         = "13"
 NIFTY_SEG         = "IDX_I"
 REQ_SUB           = 15
+REQ_UNSUB         = 16
 RESP_TICK         = 2
+RESP_DISCONNECT   = 50
 HDR_FMT           = ">H H I I H f"
+
+DISCONNECT_REASONS = {
+    800: "Internal Server Error",
+    804: "Too many instruments (exceeds limit)",
+    805: "Too many connections (max 5 per token) — close other Dhan sessions",
+    806: "Data APIs not subscribed — check your Dhan plan",
+    807: "Access token expired — generate a new token",
+    808: "Authentication failed — Client ID or Token invalid",
+    809: "Access token invalid — regenerate token",
+    810: "Client ID invalid — check credentials",
+    811: "Invalid Expiry Date",
+    812: "Invalid Date Format",
+    813: "Invalid SecurityId",
+    814: "Invalid Request",
+}
+
+def _parse_hdr(m: bytes):
+    if len(m) < 8: return None
+    return {"code": m[0], "sid": str(struct.unpack_from("<I", m, 4)[0]), "payload": m[8:]}
+
+def _parse_tick(p: bytes):
+    if len(p) < 8: return None
+    return {"ltp": float(struct.unpack_from("<f", p, 0)[0]),
+            "ltt": int(struct.unpack_from("<I", p, 4)[0])}
+
+def _parse_disc(p: bytes):
+    if len(p) < 2: return None
+    try: return int(struct.unpack_from("<H", p, 0)[0])
+    except: return None
 SEG_MAP           = {1:"NSE_EQ",2:"NSE_FNO",3:"BSE_EQ",8:"MCX_COMM",9:"IDX_I"}
 MCX_LOT_MULT      = {"GOLDTEN":1,"SILVERMICRO":1,"CRUDEOILM":10,"ZINCMINI":1000,"GOLDPETAL":1}
 NSE_STOCKS = [
-    "GMRAIRPORT","IRFC","DBREALTY","DEVYANI","VMM","IREDA","WELSPUNLIV","PNB",
-    "JMFINANCIL","J&KBANK","IEX","JSWCEMENT","MOTHERSON","RCF","NIACL","ADANIPOWER",
-    "IRCON","CANBK","SAMMAANCAP","NCC","GAIL","SAIL","PPLPHARMA","CESC","BANKINDIA",
-    "IGL","IOC","ITCHOTELS","CGCL","JINDALSAW","SAPPHIRE","AWL","HUDCO","BANDHANBNK",
-    "CASTROLIND","FINPIPE","UNIONBANK","ASHOKLEY","AEGISVOPAK","MRPL","TATASTEEL",
-    "ENGINERSIN","WIPRO","RITES","FSL","FIRSTCRY","ACMESOLAR","ANGELONE","ETERNAL",
-    "APTUS","JIOFIN","CAMPUS","JYOTHYLAB","SCI","NLCINDIA","CROMPTON","SONATSOFTW",
-    "BLS","GPIL","CUB","ITI","BHEL","NYKAA","REDINGTON","MANAPPURAM","JSWINFRA",
-    "ONGC","LTF","PCBL","AFCONS","FEDERALBNK","GSPL","RVNL","JWL","RAILTEL","TARIL",
-    "NUVOCO","PETRONET","HONASA","COHANCE","BANKBARODA","SWIGGY","POWERGRID",
-    "LATENTVIEW","KARURVYSYA","RBLBANK","ITC","PRAJIND","EXIDEIND","EIHOTEL","VGUARD",
-    "BPCL","SAREGAMA","IGIL","ABCAPITAL","GODIGIT","RECLTD","TMPV","SWANCORP","M&MFIN",
-    "MANYAVAR","GICRE","INDIACEM","TRIVENI","GUJGASLTD","BLUEJET","NTPC","LTFOODS",
-    "TATAPOWER","RHIM","BSOFT","HINDPETRO","NATIONALUM","FIVESTAR","KALYANKJIL",
-    "SUMICHEM","KOTAKBANK","BIOCON","HAPPSTMNDS","ELECON","SYNGENE","PFC","USHAMART",
-    "POONAWALLA","DELHIVERY","AARTIIND","THELEELA","CHAMBLFERT","APOLLOTYRE","VBL",
-    "BERGEPAINT","HEXT","COALINDIA","EMAMILTD","HSCL","JKTYRE","INDUSTOWER",
-    "AGARWALEYE","TEJASNET","STARHEALTH","INDGN","BEL","AMBUJACEM","NEWGEN",
-    "TRITURBINE","CONCOR","ATGL","OIL","DABUR","AADHARHFC","ANANTRAJ","JUBLFOOD",
-    "AIIL","JSWENERGY","IIFL","PATANJALI","AKUMS","BALRAMCHIN","MINDACORP","SONACOMS",
-    "LICHSGFIN","JBMA","HEG","ELGIEQUIP","KEC","VTL","GMDCLTD","MAHSEAMLES","IRCTC",
-    "SARDAEN","RKFORGE","ZENSARTECH","JUBLINGREA",
+    "BSE",          # BSE Ltd
+    "WAAREEENER",   # Waaree Energies Ltd
 ]
-MCX_SYMS = ["GOLDTEN","SILVERMICRO","CRUDEOILM","ZINCMINI","GOLDPETAL"]
+MCX_SYMS = []   # MCX disabled
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  THEME
@@ -264,53 +275,145 @@ def place_order(cid,tok,seg,sid,side,qty,paper,log_fn=print):
 #  WEBSOCKET FEED
 # ─────────────────────────────────────────────────────────────────────────────
 class Feed:
+    """WebSocket feed — improved connection logic ported from SSL Supporter v3."""
     def __init__(self, cid, tok, insts, on_tick, on_status):
         self.cid=cid; self.tok=tok; self.insts=insts
         self._on_tick=on_tick; self._on_status=on_status
         self._ws=None; self._stop=threading.Event()
+        self._sub_lock=threading.Lock()
+        self._extra_subs: list = []   # dynamic subs (e.g. NIFTY options)
+        # Connection state
         self.connected=False; self.ticks=0
+        self._logged_once=False
+        self._opened_at=0.0; self._pkts_at_open=0
+        self._instant_disconnects=0
+        self._last_disc_code=None
+        self._last_error=""
+        self._fatal=False   # set True on unrecoverable errors
+
     def start(self): threading.Thread(target=self._run,daemon=True).start()
-    def stop(self): self._stop.set(); self._ws and self._close_ws()
-    def _close_ws(self):
-        try: self._ws.close()
-        except: pass
-    def subscribe(self,sid,seg):
+
+    def stop(self):
+        self._stop.set()
         if self._ws:
-            try: self._ws.send(json.dumps({"RequestCode":REQ_SUB,"InstrumentCount":1,
-                    "InstrumentList":[{"ExchangeSegment":seg,"SecurityId":sid}]}))
+            try: self._ws.close()
             except: pass
+
+    def subscribe(self, sid, seg):
+        """Subscribe a new instrument (e.g. NIFTY option) after WS is open."""
+        entry={"ExchangeSegment":seg,"SecurityId":sid}
+        with self._sub_lock: self._extra_subs.append(entry)
+        if self._ws and self.connected:
+            try:
+                self._ws.send(json.dumps({"RequestCode":REQ_SUB,
+                    "InstrumentCount":1,"InstrumentList":[entry]}))
+            except Exception as e:
+                self._on_status(f"[WS] Sub error {sid}: {e}")
+
     def _run(self):
-        delay=5
-        while not self._stop.is_set():
+        delay=3
+        while not self._stop.is_set() and not self._fatal:
             url=WS_URL.format(tok=self.tok,cid=self.cid)
-            self._ws=websocket.WebSocketApp(url,on_open=self._open,
-                on_message=self._msg,
-                on_error=lambda ws,e: self._on_status(f"WS error: {e}"),
-                on_close=lambda ws,*a: self._on_status("WS disconnected"))
-            self._ws.run_forever(ping_interval=20,ping_timeout=10)
+            websocket.enableTrace(False)
+            self._ws=websocket.WebSocketApp(url,
+                on_open=self._wso, on_message=self._wsm,
+                on_error=self._wse, on_close=self._wsc)
+            self._last_disc_code=None; self._last_error=""
+            self._ws.run_forever(ping_interval=20, ping_timeout=10)
             self.connected=False
-            if not self._stop.is_set():
-                self._on_status(f"WS reconnecting in {delay}s...")
-                time.sleep(delay); delay=min(delay*2,60)
-    def _open(self,ws):
+            if self._stop.is_set() or self._fatal: break
+            self._on_status(f"[WS] Reconnecting in {delay}s...")
+            time.sleep(delay)
+            delay=min(delay*2, 60)   # exponential backoff, cap 60s
+
+    def _wso(self, ws):
+        """On open: subscribe all instruments + re-subscribe any extras."""
+        self.connected=True
+        self._opened_at=time.time()
+        self._pkts_at_open=self.ticks
+        self._instant_disconnects=0
+        # Subscribe main instruments in batches of 100
         BATCH=100; total=len(self.insts)
-        for i in range(0,total,BATCH):
+        for i in range(0, total, BATCH):
             batch=self.insts[i:i+BATCH]
-            ws.send(json.dumps({"RequestCode":REQ_SUB,"InstrumentCount":len(batch),
-                "InstrumentList":[{"ExchangeSegment":seg,"SecurityId":sid} for sid,seg in batch]}))
+            ws.send(json.dumps({"RequestCode":REQ_SUB,
+                "InstrumentCount":len(batch),
+                "InstrumentList":[{"ExchangeSegment":seg,"SecurityId":sid}
+                                   for sid,seg in batch]}))
             if i+BATCH<total: time.sleep(0.1)
-        self.connected=True; self._on_status(f"WS connected — {total} instruments")
-    def _msg(self,ws,raw):
+        # Re-subscribe extras (e.g. active NIFTY option on reconnect)
+        with self._sub_lock: extras=list(self._extra_subs)
+        if extras:
+            try:
+                ws.send(json.dumps({"RequestCode":REQ_SUB,
+                    "InstrumentCount":len(extras),"InstrumentList":extras}))
+                self._on_status(f"[WS] Re-subscribed {len(extras)} extra instrument(s)")
+            except Exception as e:
+                self._on_status(f"[WS] Re-sub error: {e}")
+        if not self._logged_once:
+            self._on_status(f"[WS] Connected — {total} instruments subscribed")
+            self._logged_once=True
+        else:
+            self._on_status(f"[WS] Reconnected — {total} instruments")
+
+    def _wsm(self, ws, raw):
+        """On message: parse header, handle disconnect codes and ticks."""
         try:
             b=bytes(raw)
-            if len(b)<18: return
-            hdr=struct.unpack_from(HDR_FMT,b,0)
-            if int(hdr[1])!=RESP_TICK: return
-            sid=str(int(hdr[2])); seg_c=int(hdr[3]); ltp=float(hdr[5])
-            if ltp<=0: return
-            self.ticks+=1; seg=SEG_MAP.get(seg_c,"")
-            self._on_tick(sid,seg,ltp)
+            h=_parse_hdr(b)
+            if not h: return
+            # Handle Dhan disconnect packets
+            if h["code"]==RESP_DISCONNECT:
+                code=_parse_disc(h["payload"])
+                if code is not None:
+                    desc=DISCONNECT_REASONS.get(code, "Unknown reason")
+                    self._on_status(f"[WS] Dhan disconnect code={code}: {desc}")
+                    self._last_disc_code=code
+                    # Fatal codes — don't retry, require manual fix
+                    if code in (806,808,809,810):
+                        self._on_status("[WS] ❌ Fatal error — stop and fix before restarting")
+                        self._fatal=True
+                    elif code==807:
+                        self._on_status("[WS] Token expired — generate a new token and restart")
+                        self._fatal=True
+                    elif code==805:
+                        self._on_status("[WS] Too many sessions — close other Dhan windows")
+                return
+            if h["code"]!=RESP_TICK: return
+            t=_parse_tick(h["payload"])
+            if not t or t["ltp"]<=0: return
+            self.ticks+=1
+            self._on_tick(h["sid"], "", t["ltp"])
         except: pass
+
+    def _wse(self, ws, err):
+        self.connected=False
+        self._last_error=str(err)
+        if "429" in self._last_error:
+            self._on_status("[WS] 429 — IP not whitelisted or token already in use")
+        else:
+            self._on_status(f"[WS] Error: {err}")
+
+    def _wsc(self, ws, *args):
+        """On close: detect instant disconnects, apply smart retry logic."""
+        was_connected=self.connected
+        self.connected=False
+        if self._last_disc_code is not None: return   # handled in _wsm
+        lifetime=time.time()-self._opened_at if self._opened_at else 999
+        ticks_in_session=self.ticks-self._pkts_at_open
+        if was_connected and lifetime<5 and ticks_in_session==0:
+            self._instant_disconnects+=1
+            self._on_status(
+                f"[WS] Instant disconnect ({lifetime:.1f}s, 0 ticks) "
+                f"— #{self._instant_disconnects}")
+            if self._instant_disconnects==1:
+                self._on_status("[WS] Likely: another active WS session, IP not whitelisted, or stale token")
+            if self._instant_disconnects>=5:
+                self._on_status("[WS] ❌ 5 instant disconnects — stopping. Fix and restart.")
+                self._fatal=True
+        elif was_connected:
+            self._instant_disconnects=0
+            self._on_status("[WS] Disconnected — will reconnect")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ENGINE
@@ -327,8 +430,7 @@ class Engine:
             k=f"{st.seg}:{st.sid}"
             self._sid_map[k]=st; self._sid_map[st.sid]=st
             self._aggs[k]=CandleAgg(iv_sec)
-        self._aggs[f"{NIFTY_SEG}:{NIFTY_SID}"]=CandleAgg(iv_sec)
-        feed_insts=[(st.sid,st.seg) for st in insts]+[(NIFTY_SID,NIFTY_SEG)]
+        feed_insts=[(st.sid,st.seg) for st in insts]
         self._feed=Feed(cid,tok,feed_insts,self._tick,self._ws_status)
         self.ws_status="Not started"; self.next_candle="-"; self._startup_done=set()
     def start(self): threading.Thread(target=self._run,daemon=True).start()
@@ -338,23 +440,21 @@ class Engine:
             if st.position!="FLAT" and not st.sq_done:
                 self._close(st,"SqOff"); st.sq_done=True; time.sleep(0.12)
     def _tick(self,sid,seg,ltp):
-        key=f"{seg}:{sid}" if seg else sid
-        st=self._sid_map.get(key) or self._sid_map.get(sid)
         now=time.time()
+        # Try sid-only lookup first (most reliable)
+        st=self._sid_map.get(sid)
         if st:
             with self._lock: st.ltp=round(ltp,2); st.last_tick=now
-            agg=self._aggs.get(key) or self._aggs.get(f"{st.seg}:{st.sid}")
+            agg=self._aggs.get(f"{st.seg}:{st.sid}")
             if agg: agg.on_tick(ltp,now)
             return
-        if sid==NIFTY_SID:
-            agg=self._aggs.get(f"{NIFTY_SEG}:{NIFTY_SID}")
-            if agg: agg.on_tick(ltp,now)
+
     def _ws_status(self,msg):
         self.ws_status=msg; self.log(f"[WS] {msg}")
     def _run(self):
         # Seed
         rest_iv="1" if self.iv_sec<=60 else "5" if self.iv_sec<=300 else "15"
-        all_seed=list(self.insts)+[None]
+        all_seed=list(self.insts)
         self.log(f"[Engine] Seeding {len(all_seed)} instruments...")
         for i,st in enumerate(all_seed):
             if self._stop.is_set(): break
@@ -368,7 +468,7 @@ class Engine:
                     with self._lock:
                         if c: st.ltp=float(c[-1]["close"])
             except Exception as e:
-                nm="NIFTY" if st is None else st.name
+                # nm already available as st.name
                 self.log(f"[seed ERR] {nm}: {e}")
             if (i+1)%5==0: time.sleep(1.0)
         self.log("[Engine] Seeding done — starting WS")
@@ -387,15 +487,14 @@ class Engine:
         t=datetime.now().strftime("%H:%M")
         for st in self.insts:
             if st.sq_done: continue
-            sq=self.mcx_sq if st.is_mcx else self.nse_sq
+            sq=self.nse_sq
             if t>=sq and st.position!="FLAT":
                 self.log(f"[SqOff] {st.name}")
                 self._close(st,"SqOff"); st.sq_done=True; time.sleep(0.12)
     def _process(self,startup):
         GAP=0.12
-        mcx=[s for s in self.insts if s.is_mcx and not s.skip and not s.sq_done]
-        nse=[s for s in self.insts if not s.is_mcx and not s.skip and not s.sq_done]
-        for st in mcx+nse:
+        active=[s for s in self.insts if not s.skip and not s.sq_done]
+        for st in active:
             if self._stop.is_set(): break
             agg=self._aggs.get(f"{st.seg}:{st.sid}")
             if not agg or not agg.ready(): continue
@@ -465,11 +564,7 @@ class App(ctk.CTk):
         self.paper_var=ctk.BooleanVar(value=_s.get("paper",True))
         self.nse_sq_var=ctk.StringVar(value=_s.get("nse_sq","15:15"))
         self.mcx_sq_var=ctk.StringVar(value=_s.get("mcx_sq","23:25"))
-        self.gold_v=ctk.IntVar(value=_s.get("gold",1))
-        self.silv_v=ctk.IntVar(value=_s.get("silv",1))
-        self.crude_v=ctk.IntVar(value=_s.get("crude",1))
-        self.zinc_v=ctk.IntVar(value=_s.get("zinc",1))
-        self.gp_v=ctk.IntVar(value=_s.get("gp",1))
+
         self.default_qty_v=ctk.IntVar(value=_s.get("default_qty",1))
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -496,11 +591,7 @@ class App(ctk.CTk):
                 "paper":       self.paper_var.get(),
                 "nse_sq":      self.nse_sq_var.get(),
                 "mcx_sq":      self.mcx_sq_var.get(),
-                "gold":        self.gold_v.get(),
-                "silv":        self.silv_v.get(),
-                "crude":       self.crude_v.get(),
-                "zinc":        self.zinc_v.get(),
-                "gp":          self.gp_v.get(),
+
                 "default_qty": self.default_qty_v.get(),
             }
             # stock_qtys removed — default_qty_v covers all NSE stocks uniformly
@@ -572,17 +663,7 @@ class App(ctk.CTk):
             text_color=TD).pack(side="left")
         ctk.CTkEntry(r0,textvariable=self.default_qty_v,width=60,justify="center",
             font=FONT).pack(side="left",padx=4)
-        ctk.CTkFrame(qf,fg_color=BD,height=1).pack(fill="x",padx=12,pady=4)
-        for lbl,var in [("GOLDTEN:",self.gold_v),("SILVERMICRO:",self.silv_v),
-                        ("CRUDEOILM:",self.crude_v),("ZINCMINI:",self.zinc_v),
-                        ("GOLDPETAL:",self.gp_v)]:
-            r=ctk.CTkFrame(qf,fg_color="transparent"); r.pack(fill="x",padx=12,pady=2)
-            ctk.CTkLabel(r,text=lbl,width=130,anchor="w",font=FONT,
-                text_color=TD).pack(side="left")
-            ctk.CTkEntry(r,textvariable=var,width=60,justify="center",
-                font=FONT).pack(side="left",padx=4)
-            ctk.CTkLabel(r,text="lots",font=("Segoe UI",10,"bold"),
-                text_color=GY).pack(side="left")
+
         # Sessions
         sf=card(2,"Session & Mode")
         ctk.CTkSwitch(sf,text="Paper Mode (safe)",variable=self.paper_var,
@@ -590,7 +671,7 @@ class App(ctk.CTk):
         ctk.CTkFrame(sf,fg_color=BD,height=1).pack(fill="x",padx=12,pady=4)
         ctk.CTkLabel(sf,text="Auto Square-off Time",font=FONT,
             text_color=TD).pack(anchor="w",padx=12,pady=(4,2))
-        for lbl2,var2 in [("NSE/NIFTY:",self.nse_sq_var),("MCX:",self.mcx_sq_var)]:
+        for lbl2,var2 in [("Square-off at:",self.nse_sq_var)]:
             r2=ctk.CTkFrame(sf,fg_color="transparent"); r2.pack(fill="x",padx=12,pady=2)
             ctk.CTkLabel(r2,text=lbl2,width=80,anchor="w",font=FONT,
                 text_color=TD).pack(side="left")
@@ -709,15 +790,6 @@ class App(ctk.CTk):
 
     def _resolve(self,rows):
         insts=[]
-        # MCX
-        for sym,v in [("GOLDTEN",self.gold_v),("SILVERMICRO",self.silv_v),
-                      ("CRUDEOILM",self.crude_v),("ZINCMINI",self.zinc_v),
-                      ("GOLDPETAL",self.gp_v)]:
-            m=resolve_mcx(rows,sym,self._log)
-            if not m: continue
-            mult=MCX_LOT_MULT.get(sym,1)
-            st=InstrState(sym,m["sid"],"MCX_COMM",is_mcx=True,lot_mult=mult,qty=v.get())
-            insts.append(st)
         # NSE
         self._log("  Building NSE index...")
         nse_idx=build_nse_index(rows)
@@ -769,19 +841,9 @@ class App(ctk.CTk):
         sma=max(1,self.sma_var.get())
         # Sync qty — always read CURRENT values from UI fields
         nse_qty = self.default_qty_v.get()   # single source of truth for all NSE
-        mcx_qty_map = {
-            "GOLDTEN":    self.gold_v.get(),
-            "SILVERMICRO":self.silv_v.get(),
-            "CRUDEOILM":  self.crude_v.get(),
-            "ZINCMINI":   self.zinc_v.get(),
-            "GOLDPETAL":  self.gp_v.get(),
-        }
         for st in self.instruments:
-            if st.is_mcx:
-                st.qty = mcx_qty_map.get(st.name, st.qty)
-            else:
-                st.qty = nse_qty
-        self._log(f"[START] NSE qty={nse_qty}  MCX: {mcx_qty_map}")
+            st.qty = nse_qty
+        self._log(f"[START] qty={nse_qty} for all instruments")
         self.engine=Engine(cid,tok,self.instruments,iv,sma,
             self.paper_var.get(),self.nse_sq_var.get(),self.mcx_sq_var.get(),
             log_fn=self._log)

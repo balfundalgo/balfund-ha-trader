@@ -68,6 +68,7 @@ class RateGate:
 
 DATA_GATE  = RateGate(4.0)   # 4 req/sec for data (limit is 5, keep margin)
 ORDER_GATE = RateGate(8.0)   # 8 req/sec for orders (limit is 10, keep margin)
+OC_GATE    = RateGate(0.30)  # Option chain: 1 req per 3.3s (Dhan limit 1/3s)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  THEME
@@ -245,7 +246,7 @@ class OptionResolver:
             c=self._exp_cache.get(idx["name"])
             if c and (time.time()-c[0])<300:   # 5-min cache
                 return c[1]
-        DATA_GATE.wait()
+        OC_GATE.wait()
         r=requests.post(OC_EXPIRY_URL,headers=self._hdrs(),
             json={"UnderlyingScrip":idx["u_scrip"],"UnderlyingSeg":idx["u_seg"]},timeout=10)
         r.raise_for_status()
@@ -261,10 +262,10 @@ class OptionResolver:
             c=self._chain_cache.get(key)
             if c and (time.time()-c[0])<30:   # 30s cache to avoid hammering
                 return c[1]
-        DATA_GATE.wait()
+        OC_GATE.wait()
         r=requests.post(OC_URL,headers=self._hdrs(),
             json={"UnderlyingScrip":idx["u_scrip"],"UnderlyingSeg":idx["u_seg"],
-                  "ExpiryDate":expiry},timeout=10)
+                  "Expiry":expiry},timeout=10)
         r.raise_for_status()
         d=r.json()
         with self._lock:
@@ -578,6 +579,8 @@ class Engine:
             self.sq_all(); self.sq_done=True
 
     def _process(self, startup):
+        if self.sq_done:   # after square-off, no new entries for the day
+            return
         for t in self.traders:
             if self._stop.is_set(): break
             agg=self._aggs.get(t.idx["sid"])

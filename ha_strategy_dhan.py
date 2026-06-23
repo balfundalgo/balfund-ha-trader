@@ -23,7 +23,7 @@ from tkinter import ttk
 #  PATHS & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 BASE_DIR          = Path(sys.executable).parent if getattr(sys,"frozen",False) else Path(__file__).parent
-SHARED_TOKEN_FILE = Path(r"C:\balfund_shared\dhan_token.json")
+CREDS_FILE        = BASE_DIR / "balfund_dhan_creds.json"
 SETTINGS_FILE     = BASE_DIR / "balfund_st_settings.json"
 
 INTRADAY_URL  = "https://api.dhan.co/v2/charts/intraday"
@@ -159,17 +159,42 @@ def compute_supertrend(candles: List[dict], period: int, mult: float) -> List[di
 # ══════════════════════════════════════════════════════════════════════════════
 #  TOKEN
 # ══════════════════════════════════════════════════════════════════════════════
-def load_token():
+def api_generate_token(client_id: str, pin: str, totp_secret: str) -> dict:
+    """Generate a fresh access token via PIN + TOTP.
+    POST https://auth.dhan.co/app/generateAccessToken?dhanClientId=&pin=&totp="""
+    import pyotp
+    totp_code = pyotp.TOTP(totp_secret.strip().replace(" ","")).now()
+    url = "https://auth.dhan.co/app/generateAccessToken"
+    params = {"dhanClientId": client_id, "pin": pin, "totp": totp_code}
+    resp = requests.post(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if "accessToken" in data:
+        return {"success":True,"access_token":data["accessToken"],
+                "expiry":data.get("expiryTime",""),"client_name":data.get("dhanClientName","")}
+    return {"success":False,"error":data.get("errorMessage") or data.get("message") or str(data)}
+
+def api_renew_token(client_id: str, access_token: str) -> dict:
+    """Renew an existing valid token. GET https://api.dhan.co/v2/RenewToken"""
+    url = "https://api.dhan.co/v2/RenewToken"
+    headers = {"access-token":access_token,"dhanClientId":client_id,"Content-Type":"application/json"}
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if "accessToken" in data:
+        return {"success":True,"access_token":data["accessToken"],
+                "expiry":data.get("expiryTime",""),"client_name":data.get("dhanClientName","")}
+    return {"success":False,"error":data.get("errorMessage") or data.get("message") or str(data)}
+
+def api_verify_token(client_id: str, access_token: str) -> bool:
+    """Ping profile endpoint to check token validity."""
+    if not access_token: return False
     try:
-        if SHARED_TOKEN_FILE.exists():
-            d=json.loads(SHARED_TOKEN_FILE.read_text())
-            return d.get("client_id",""), d.get("access_token","")
-    except: pass
-    try:
-        r=requests.get("http://localhost:5555/token",timeout=3)
-        d=r.json(); return d.get("client_id",""), d.get("access_token","")
-    except: pass
-    return os.getenv("DHAN_CLIENT_ID",""), os.getenv("DHAN_ACCESS_TOKEN","")
+        resp = requests.get("https://api.dhan.co/v2/profile",
+            headers={"access-token":access_token,"client-id":client_id},timeout=10)
+        return resp.status_code==200
+    except Exception:
+        return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  REST — rate-limited
@@ -578,8 +603,17 @@ class App(ctk.CTk):
         self.engine: Optional[Engine]=None
         self._running=False
         self._log_q: queue.Queue=queue.Queue()
+        # In-app Dhan token state
+        self._access_token=""
+        self._token_client=""
+        self._token_ok=False
 
         _s=self._load()
+        _c=self._load_creds()
+        self.client_id_var=ctk.StringVar(value=_c.get("client_id",""))
+        self.pin_var=ctk.StringVar(value=_c.get("pin",""))
+        self.totp_var=ctk.StringVar(value=_c.get("totp",""))
+        self.save_creds_var=ctk.BooleanVar(value=_c.get("save",True))
         self.tf_var=ctk.StringVar(value=_s.get("tf","5s"))
         self.period_var=ctk.IntVar(value=_s.get("period",2))
         self.mult_var=ctk.DoubleVar(value=_s.get("mult",2.0))
@@ -600,6 +634,22 @@ class App(ctk.CTk):
             if SETTINGS_FILE.exists(): return json.loads(SETTINGS_FILE.read_text())
         except: pass
         return {}
+    def _load_creds(self):
+        try:
+            if CREDS_FILE.exists(): return json.loads(CREDS_FILE.read_text())
+        except: pass
+        return {}
+    def _save_creds(self):
+        try:
+            if self.save_creds_var.get():
+                CREDS_FILE.write_text(json.dumps({
+                    "client_id":self.client_id_var.get().strip(),
+                    "pin":self.pin_var.get().strip(),
+                    "totp":self.totp_var.get().strip(),
+                    "save":True},indent=2))
+            elif CREDS_FILE.exists():
+                CREDS_FILE.unlink()   # user unticked save → remove stored creds
+        except: pass
     def _save(self):
         try:
             SETTINGS_FILE.write_text(json.dumps({
@@ -609,7 +659,7 @@ class App(ctk.CTk):
                 "trade_nifty":self.trade_nifty_var.get(),"trade_sensex":self.trade_sensex_var.get(),
                 "sq":self.sq_var.get()},indent=2))
         except: pass
-    def _on_close(self): self._save(); self.destroy()
+    def _on_close(self): self._save(); self._save_creds(); self.destroy()
 
     # ── Build ──
     def _build(self):
@@ -627,13 +677,85 @@ class App(ctk.CTk):
         self._lbl_clk.pack(side="right",padx=8)
 
         nb=ctk.CTkTabview(self,fg_color=BG,segmented_button_selected_color=AC,
-            segmented_button_selected_hover_color=ACL,segmented_button_unselected_color=CARD)
+            segmented_button_selected_hover_color=ACL,segmented_button_unselected_color=CARD,
+            segmented_button_unselected_hover_color="#E5E7EB",
+            text_color="#000000")
         nb.pack(fill="both",expand=True,padx=6,pady=(0,4))
-        for t in ["Settings","Live","Log"]: nb.add(t)
+        # Make tab button text black + bold and larger for visibility
+        try:
+            nb._segmented_button.configure(font=("Segoe UI",13,"bold"),
+                text_color="#000000")
+        except Exception:
+            pass
+        for t in ["Connection","Settings","Live","Log"]: nb.add(t)
         self._nb=nb
+        self._build_connection(nb.tab("Connection"))
         self._build_settings(nb.tab("Settings"))
         self._build_live(nb.tab("Live"))
         self._build_log(nb.tab("Log"))
+
+    def _build_connection(self, p):
+        p.configure(fg_color=BG)
+        wrap=ctk.CTkFrame(p,fg_color="transparent"); wrap.pack(expand=True)
+        card=ctk.CTkFrame(wrap,fg_color=CARD,corner_radius=12,border_width=1,border_color=BD)
+        card.pack(padx=20,pady=20)
+        ctk.CTkLabel(card,text="Dhan Login",font=("Segoe UI",18,"bold"),
+            text_color=AC).pack(pady=(18,2),padx=40)
+        ctk.CTkLabel(card,text="Generate your access token directly here",
+            font=("Segoe UI",11,"bold"),text_color=TD).pack(pady=(0,14))
+        def field(label, var, show=None):
+            ctk.CTkLabel(card,text=label,font=FONT,text_color=TD,anchor="w").pack(
+                anchor="w",padx=40,pady=(6,2))
+            e=ctk.CTkEntry(card,textvariable=var,width=340,height=38,font=FONT,
+                show=show,fg_color=BG,text_color=TX,border_color=BD)
+            e.pack(padx=40); return e
+        field("Client ID", self.client_id_var)
+        field("6-Digit PIN", self.pin_var, show="*")
+        field("TOTP Secret Key", self.totp_var, show="*")
+        ctk.CTkCheckBox(card,text="Save credentials locally (this PC only)",
+            variable=self.save_creds_var,font=FONT,text_color=TD,
+            checkbox_width=20,checkbox_height=20).pack(anchor="w",padx=40,pady=(12,6))
+        self._btn_gen=ctk.CTkButton(card,text="🔑  Generate Token",font=("Segoe UI",13,"bold"),
+            fg_color=AC,hover_color=ACL,height=42,width=340,command=self._gen_token)
+        self._btn_gen.pack(padx=40,pady=(8,4))
+        self._lbl_conn=ctk.CTkLabel(card,text="● Not connected",font=("Segoe UI",12,"bold"),
+            text_color=RD)
+        self._lbl_conn.pack(pady=(8,18))
+
+    def _gen_token(self):
+        cid=self.client_id_var.get().strip()
+        pin=self.pin_var.get().strip()
+        totp=self.totp_var.get().strip().replace(" ","")
+        if not (cid and pin and totp):
+            self._lbl_conn.configure(text="● Fill all 3 fields",text_color=RD); return
+        self._lbl_conn.configure(text="● Generating...",text_color=GOLD)
+        self._btn_gen.configure(state="disabled",text="Generating...")
+        def work():
+            try:
+                res=api_generate_token(cid,pin,totp)
+                if res.get("success"):
+                    self._access_token=res["access_token"]
+                    self._token_client=cid; self._token_ok=True
+                    name=res.get("client_name","") or cid
+                    self.after(0,lambda:self._lbl_conn.configure(
+                        text=f"● Connected: {name}",text_color=GR))
+                    self._log(f"[Token] Generated OK for {name}")
+                    self._save_creds()
+                else:
+                    self._token_ok=False
+                    err=res.get("error","Unknown error")
+                    self.after(0,lambda:self._lbl_conn.configure(
+                        text=f"● Failed: {err[:40]}",text_color=RD))
+                    self._log(f"[Token] FAILED: {err}")
+            except Exception as e:
+                self._token_ok=False
+                self.after(0,lambda:self._lbl_conn.configure(
+                    text=f"● Error: {str(e)[:40]}",text_color=RD))
+                self._log(f"[Token] ERROR: {e}")
+            finally:
+                self.after(0,lambda:self._btn_gen.configure(
+                    state="normal",text="🔑  Generate Token"))
+        threading.Thread(target=work,daemon=True).start()
 
     def _build_settings(self, p):
         p.configure(fg_color=BG); p.grid_columnconfigure((0,1,2),weight=1)
@@ -729,8 +851,10 @@ class App(ctk.CTk):
 
     def _start(self):
         if self._running: return
-        cid,tok=load_token()
-        if not cid or not tok: self._set_status("No token found",RD); return
+        if not self._token_ok or not self._access_token:
+            self._set_status("Generate token first (Connection tab)",RD)
+            self._nb.set("Connection"); return
+        cid=self._token_client; tok=self._access_token
         if not (self.trade_nifty_var.get() or self.trade_sensex_var.get()):
             self._set_status("Enable at least one index",RD); return
         tf=self.tf_var.get(); iv=5 if tf=="5s" else int(tf)*60

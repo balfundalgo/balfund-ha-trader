@@ -10,8 +10,8 @@
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
-import os, sys, time, json, struct, threading, queue
-from datetime import datetime, timedelta
+import os, sys, time, json, struct, threading, queue, csv, io, re
+from datetime import datetime, timedelta, date
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
 import requests, websocket
@@ -25,16 +25,21 @@ from tkinter import ttk
 BASE_DIR          = Path(sys.executable).parent if getattr(sys,"frozen",False) else Path(__file__).parent
 CREDS_FILE        = BASE_DIR / "balfund_dhan_creds.json"
 SETTINGS_FILE     = BASE_DIR / "balfund_st_settings.json"
+MASTER_CACHE      = BASE_DIR / "dhan_master_cache.csv"
 
 INTRADAY_URL  = "https://api.dhan.co/v2/charts/intraday"
 OC_EXPIRY_URL = "https://api.dhan.co/v2/optionchain/expirylist"
 OC_URL        = "https://api.dhan.co/v2/optionchain"
 ORDER_URL     = "https://api.dhan.co/v2/orders"
+MASTER_URL    = "https://images.dhan.co/api-data/api-scrip-master.csv"
 WS_URL        = "wss://api-feed.dhan.co?version=2&token={tok}&clientId={cid}&authType=2"
 
 # Index spot definitions (confirmed from DhanHQ SDK)
 NIFTY  = {"name":"NIFTY",  "sid":"13", "seg":"IDX_I", "step":50,  "opt_seg":"NSE_FNO", "u_scrip":13, "u_seg":"IDX_I"}
 SENSEX = {"name":"SENSEX", "sid":"51", "seg":"IDX_I", "step":100, "opt_seg":"BSE_FNO", "u_scrip":51, "u_seg":"IDX_I"}
+
+# MCX futures definitions (security id resolved from master CSV at runtime)
+SILVER = {"name":"SILVERMICRO", "seg":"MCX_COMM", "lot_mult":1}
 
 # WS packet
 REQ_SUB         = 15
@@ -200,11 +205,11 @@ def api_verify_token(client_id: str, access_token: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 #  REST — rate-limited
 # ══════════════════════════════════════════════════════════════════════════════
-def fetch_ohlc(cid, tok, sid, seg, iv, days=5):
+def fetch_ohlc(cid, tok, sid, seg, iv, days=5, instrument="INDEX"):
     DATA_GATE.wait()
     now=datetime.now()
     hdrs={"Content-Type":"application/json","access-token":tok,"client-id":cid}
-    pl={"securityId":sid,"exchangeSegment":seg,"instrument":"INDEX",
+    pl={"securityId":sid,"exchangeSegment":seg,"instrument":instrument,
         "expiryCode":0,"oi":False,"interval":iv,
         "fromDate":(now-timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"),
         "toDate":now.strftime("%Y-%m-%d %H:%M:%S")}
@@ -226,6 +231,55 @@ def fetch_ohlc(cid, tok, sid, seg, iv, days=5):
         out.append({"bucket":epoch,"open":float(opens[i]),"high":float(highs[i]),
                     "low":float(lows[i]),"close":float(closes[i])})
     return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MASTER CSV + MCX FUTURES RESOLVER
+# ══════════════════════════════════════════════════════════════════════════════
+def load_master(log_fn=print):
+    if MASTER_CACHE.exists():
+        age=(time.time()-MASTER_CACHE.stat().st_mtime)/3600
+        if age<12:
+            log_fn(f"  Using cached master CSV ({age:.1f}h old)")
+            raw=MASTER_CACHE.read_text(encoding="utf-8",errors="ignore")
+            if raw.startswith("\ufeff"): raw=raw[1:]
+            return list(csv.DictReader(io.StringIO(raw)))
+    log_fn("  Downloading master CSV...")
+    r=requests.get(MASTER_URL,stream=True,timeout=120); r.raise_for_status()
+    buf=io.BytesIO()
+    for chunk in r.iter_content(65536): buf.write(chunk)
+    raw=buf.getvalue().decode("utf-8",errors="ignore")
+    if raw.startswith("\ufeff"): raw=raw[1:]
+    MASTER_CACHE.write_text(raw,encoding="utf-8")
+    return list(csv.DictReader(io.StringIO(raw)))
+
+def resolve_mcx_future(rows, sym, log_fn=print) -> Optional[dict]:
+    """Resolve nearest-expiry MCX futures contract security id for a commodity."""
+    today=date.today(); safe=today+timedelta(days=2)
+    MONTHS={"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+            "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+    variants=[sym.upper(), sym.upper().replace("MICRO","MIC"), sym.upper().replace("MINI","")]
+    found=[]
+    for row in rows:
+        if row.get("SEM_EXM_EXCH_ID","").strip().upper()!="MCX": continue
+        ts=row.get("SEM_TRADING_SYMBOL","").strip().upper()
+        if not ts.endswith("-FUT"): continue
+        if not any(ts.startswith(v) for v in variants): continue
+        m=re.search(r"(\d{2})([A-Z]{3})(\d{4})",ts)
+        if not m: continue
+        try: exp=date(int(m.group(3)),MONTHS[m.group(2)],int(m.group(1)))
+        except: continue
+        sid=row.get("SEM_SMST_SECURITY_ID","").strip()
+        lot=row.get("SEM_LOT_UNITS","").strip()
+        found.append((exp,sid,ts,lot))
+    active=sorted([x for x in found if x[0]>=safe],key=lambda x:x[0])
+    if not active: active=sorted([x for x in found if x[0]>=today],key=lambda x:x[0])
+    if not active:
+        log_fn(f"  ✗ {sym} futures contract not found"); return None
+    e,sid,ts,lot=active[0]
+    try: lot_i=int(float(lot))
+    except: lot_i=1
+    log_fn(f"  ✓ {sym} sid={sid}  {ts}  expiry={e}  lot={lot_i}")
+    return {"sid":sid,"ts":ts,"expiry":str(e),"lot":lot_i}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OPTION CHAIN  (cached + rate-limited)
@@ -307,15 +361,41 @@ def place_order(cid, tok, seg, sid, side, qty, paper, log_fn):
         return 0.0
     ORDER_GATE.wait()
     hdrs={"Content-Type":"application/json","access-token":tok,"client-id":cid}
-    pl={"dhanClientId":cid,"transactionType":side,"exchangeSegment":seg,
+    pl={"dhanClientId":str(cid),"transactionType":side,"exchangeSegment":seg,
         "productType":"INTRADAY","orderType":"MARKET","validity":"DAY",
-        "securityId":sid,"quantity":qty}
+        "securityId":str(sid),"quantity":int(qty),
+        "disclosedQuantity":0,"price":0,"triggerPrice":0,"afterMarketOrder":False}
+    last_err=""
     for att in range(3):
-        r=requests.post(ORDER_URL,headers=hdrs,json=pl,timeout=15)
+        try:
+            r=requests.post(ORDER_URL,headers=hdrs,json=pl,timeout=15)
+        except Exception as e:
+            last_err=f"network: {e}"; time.sleep(1.0); continue
+        # 429 — back off and retry
         if r.status_code==429:
-            time.sleep(1.5*(att+1)); continue
-        r.raise_for_status(); break
-    return float(r.json().get("avgPrice",0) or 0)
+            last_err="429 rate limit"; time.sleep(1.5*(att+1)); continue
+        # Non-200 — log the body so we can see WHY
+        if r.status_code!=200:
+            try: body=r.json()
+            except: body=r.text[:200]
+            last_err=f"HTTP {r.status_code}: {body}"
+            log_fn(f"[ORDER REJECTED] {side} {seg}:{sid} qty={qty} → {last_err}")
+            return 0.0
+        # 200 — but check orderStatus
+        try: d=r.json()
+        except:
+            log_fn(f"[ORDER ERR] {side} {seg}:{sid}: bad JSON response"); return 0.0
+        status=str(d.get("orderStatus","")).upper()
+        oid=d.get("orderId","")
+        if status in ("REJECTED","CANCELLED"):
+            err=d.get("omsErrorDescription") or d.get("errorMessage") or "rejected by broker"
+            log_fn(f"[ORDER REJECTED] {side} {seg}:{sid} qty={qty} id={oid} → {err}")
+            return 0.0
+        # Accepted (TRANSIT / PENDING / TRADED)
+        log_fn(f"[ORDER OK] {side} {seg}:{sid} qty={qty} id={oid} status={status}")
+        return float(d.get("averageTradedPrice",0) or d.get("price",0) or 0)
+    log_fn(f"[ORDER FAILED] {side} {seg}:{sid} qty={qty} after retries → {last_err}")
+    return 0.0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WEBSOCKET FEED  (improved connection logic)
@@ -492,11 +572,81 @@ class IndexTrader:
         if self.position!="FLAT": self._exit()
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FUTURE TRADER  (SILVERMICRO — long/short reversal on its own chart)
+# ══════════════════════════════════════════════════════════════════════════════
+class FutureTrader:
+    def __init__(self, fut, sid, lot_size, lots, period, mult, paper, feed,
+                 cid, tok, log_fn):
+        self.fut=fut; self.name=fut["name"]; self.sid=sid; self.seg=fut["seg"]
+        self.lot_size=lot_size; self.lots=lots
+        self.period=period; self.mult=mult; self.paper=paper
+        self.feed=feed; self.cid=cid; self.tok=tok; self.log=log_fn
+        self.ltp=0.0
+        self.st_value=0.0; self.st_dir="-"; self.atr=0.0
+        self.position="FLAT"          # FLAT / LONG / SHORT
+        self.entry=0.0; self.bar_time="-"; self.status="Waiting"; self.strike=0
+        self._startup_done=False; self._lock=threading.Lock()
+
+    @property
+    def pnl(self):
+        if self.position=="FLAT" or self.entry==0: return 0.0
+        d=(self.ltp-self.entry) if self.position=="LONG" else (self.entry-self.ltp)
+        return round(d*self.lots*self.lot_size,2)
+
+    def on_tick(self, sid, ltp):
+        if sid==self.sid:
+            with self._lock: self.ltp=round(ltp,2)
+
+    def process(self, candles, startup):
+        sts=compute_supertrend(candles, self.period, self.mult)
+        if not sts: return
+        last=sts[-1]
+        with self._lock:
+            self.st_value=last["st"]; self.st_dir=last["dir"]; self.atr=last["atr"]
+            self.bar_time=datetime.fromtimestamp(last["bucket"]).strftime("%H:%M:%S")
+        new_dir=last["dir"]
+        want="LONG" if new_dir=="GREEN" else "SHORT"
+
+        if startup and not self._startup_done:
+            self._startup_done=True
+            self.log(f"[{self.name}] Startup → ST={new_dir} → go {want}")
+            self._go(want); return
+        if startup: return
+
+        if self.position!=want:
+            self.log(f"[{self.name}] ST flipped {new_dir} → reverse to {want}")
+            if self.position!="FLAT": self._close()
+            time.sleep(0.15)
+            self._go(want)
+
+    def _go(self, direction):
+        side="BUY" if direction=="LONG" else "SELL"
+        qty=self.lots*self.lot_size
+        price=place_order(self.cid,self.tok,self.seg,self.sid,side,qty,self.paper,self.log)
+        with self._lock:
+            self.position=direction; self.entry=price or self.ltp
+            self.status=f"{'↑LONG' if direction=='LONG' else '↓SHORT'}"
+        self.log(f"[{self.name}] {side} {qty} @{self.entry:.2f}  ({direction})")
+
+    def _close(self):
+        if self.position=="FLAT": return
+        side="SELL" if self.position=="LONG" else "BUY"
+        qty=self.lots*self.lot_size; pnl=self.pnl
+        place_order(self.cid,self.tok,self.seg,self.sid,side,qty,self.paper,self.log)
+        self.log(f"[{self.name}] CLOSE {side} {qty}  P&L=₹{pnl:+.2f}")
+        with self._lock:
+            self.position="FLAT"; self.entry=0.0; self.status="FLAT"
+
+    def square_off(self):
+        if self.position!="FLAT": self._close()
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 class Engine:
     def __init__(self, cid, tok, iv_sec, period, mult, paper,
-                 nifty_lots, sensex_lots, sq_time, trade_nifty, trade_sensex, log_fn):
+                 nifty_lots, sensex_lots, sq_time, trade_nifty, trade_sensex,
+                 trade_silver, silver_lots, log_fn):
         self.cid=cid; self.tok=tok; self.iv_sec=iv_sec
         self.period=period; self.mult=mult; self.paper=paper
         self.sq_time=sq_time; self.log=log_fn
@@ -506,7 +656,7 @@ class Engine:
         self.resolver=OptionResolver(cid,tok,log_fn)
         self.feed=Feed(cid,tok,self._on_tick,self._on_status)
 
-        # Traders
+        # Index option traders
         self.traders: List[IndexTrader]=[]
         if trade_nifty:
             self.traders.append(IndexTrader(NIFTY,nifty_lots,period,mult,paper,
@@ -523,38 +673,77 @@ class Engine:
             self._spot_map[t.idx["sid"]]=t
             self.feed.add_sub(t.idx["sid"], t.idx["seg"])
 
+        # Future traders (resolved later in _run after master CSV loads)
+        self._trade_silver=trade_silver; self._silver_lots=silver_lots
+        self.futures: List[FutureTrader]=[]
+        self._fut_map: Dict[str,FutureTrader]={}
+
     def start(self): threading.Thread(target=self._run,daemon=True).start()
     def stop(self): self._stop.set(); self.feed.stop()
     def sq_all(self):
         for t in self.traders: t.square_off()
+        for f in self.futures: f.square_off()
 
     def _on_status(self, msg):
         self.ws_status=msg; self.log(f"[WS] {msg}")
 
     def _on_tick(self, sid, ltp):
         now=time.time()
-        # Spot tick?
+        # Index spot tick?
         t=self._spot_map.get(sid)
         if t:
             t.on_spot_tick(ltp)
             agg=self._aggs.get(sid)
             if agg: agg.on_tick(ltp, now)
             return
-        # Option tick? route to all traders (each checks its own opt_sid)
+        # Future tick? (signal source = traded instrument)
+        f=self._fut_map.get(sid)
+        if f:
+            f.on_tick(sid, ltp)
+            agg=self._aggs.get(sid)
+            if agg: agg.on_tick(ltp, now)
+            return
+        # Option tick → route to all index traders
         for tr in self.traders:
             tr.on_opt_tick(sid, ltp)
 
     def _run(self):
-        self.log(f"[Engine] Seeding {len(self.traders)} index spots...")
         rest_iv="1" if self.iv_sec<=60 else "5" if self.iv_sec<=300 else "15"
+        # Resolve SILVERMICRO future from master CSV
+        if self._trade_silver:
+            try:
+                rows=load_master(self.log)
+                info=resolve_mcx_future(rows,"SILVERMICRO",self.log)
+                if info:
+                    ft=FutureTrader(SILVER,info["sid"],info["lot"],self._silver_lots,
+                        self.period,self.mult,self.paper,self.feed,
+                        self.cid,self.tok,self.log)
+                    self.futures.append(ft)
+                    self._fut_map[info["sid"]]=ft
+                    self._aggs[info["sid"]]=CandleAgg(self.iv_sec)
+                    self.feed.add_sub(info["sid"], SILVER["seg"])
+            except Exception as e:
+                self.log(f"[Silver resolve ERR] {e}")
+
+        self.log(f"[Engine] Seeding {len(self.traders)} indices + {len(self.futures)} futures...")
+        # Seed index spots
         for t in self.traders:
             try:
-                c=fetch_ohlc(self.cid,self.tok,t.idx["sid"],t.idx["seg"],rest_iv)
+                c=fetch_ohlc(self.cid,self.tok,t.idx["sid"],t.idx["seg"],rest_iv,instrument="INDEX")
                 self._aggs[t.idx["sid"]]=CandleAgg(self.iv_sec,c[-200:])
                 if c: t.spot=float(c[-1]["close"])
                 self.log(f"[seed] {t.idx['name']} {len(c)} bars  spot={t.spot:.2f}")
             except Exception as e:
                 self.log(f"[seed ERR] {t.idx['name']}: {e}")
+        # Seed futures
+        for f in self.futures:
+            try:
+                c=fetch_ohlc(self.cid,self.tok,f.sid,f.seg,rest_iv,instrument="FUTCOM")
+                self._aggs[f.sid]=CandleAgg(self.iv_sec,c[-200:])
+                if c: f.ltp=float(c[-1]["close"])
+                self.log(f"[seed] {f.name} {len(c)} bars  ltp={f.ltp:.2f}")
+            except Exception as e:
+                self.log(f"[seed ERR] {f.name}: {e}")
         self.log("[Engine] Seed done — starting WebSocket")
         self.feed.start(); time.sleep(2)
 
@@ -589,6 +778,14 @@ class Engine:
             candles=agg.candles()
             t.process(candles, startup)
             time.sleep(0.15)   # gap between index order bursts
+        for f in self.futures:
+            if self._stop.is_set(): break
+            agg=self._aggs.get(f.sid)
+            if not agg or not agg.ready(self.period+2):
+                continue
+            candles=agg.candles()
+            f.process(candles, startup)
+            time.sleep(0.15)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GUI
@@ -625,6 +822,8 @@ class App(ctk.CTk):
         self.sensex_lots_var=ctk.IntVar(value=_s.get("sensex_lots",1))
         self.trade_nifty_var=ctk.BooleanVar(value=_s.get("trade_nifty",True))
         self.trade_sensex_var=ctk.BooleanVar(value=_s.get("trade_sensex",True))
+        self.trade_silver_var=ctk.BooleanVar(value=_s.get("trade_silver",False))
+        self.silver_lots_var=ctk.IntVar(value=_s.get("silver_lots",1))
         self.sq_var=ctk.StringVar(value=_s.get("sq","15:15"))
 
         self._build()
@@ -660,6 +859,7 @@ class App(ctk.CTk):
                 "mult":self.mult_var.get(),"paper":self.paper_var.get(),
                 "nifty_lots":self.nifty_lots_var.get(),"sensex_lots":self.sensex_lots_var.get(),
                 "trade_nifty":self.trade_nifty_var.get(),"trade_sensex":self.trade_sensex_var.get(),
+                "trade_silver":self.trade_silver_var.get(),"silver_lots":self.silver_lots_var.get(),
                 "sq":self.sq_var.get()},indent=2))
         except: pass
     def _on_close(self): self._save(); self._save_creds(); self.destroy()
@@ -790,6 +990,12 @@ class App(ctk.CTk):
         r2=ctk.CTkFrame(ix,fg_color="transparent"); r2.pack(fill="x",padx=14,pady=2)
         ctk.CTkLabel(r2,text="SENSEX lots:",width=110,anchor="w",font=FONT,text_color=TD).pack(side="left")
         ctk.CTkEntry(r2,textvariable=self.sensex_lots_var,width=60,justify="center",font=FONT).pack(side="left",padx=4)
+        ctk.CTkFrame(ix,fg_color=BD,height=1).pack(fill="x",padx=12,pady=6)
+        ctk.CTkSwitch(ix,text="Trade SILVERMICRO (Fut)",variable=self.trade_silver_var,font=FONT,
+            button_color=AC,progress_color=ACL).pack(anchor="w",padx=12,pady=4)
+        r3=ctk.CTkFrame(ix,fg_color="transparent"); r3.pack(fill="x",padx=14,pady=2)
+        ctk.CTkLabel(r3,text="SILVER lots:",width=110,anchor="w",font=FONT,text_color=TD).pack(side="left")
+        ctk.CTkEntry(r3,textvariable=self.silver_lots_var,width=60,justify="center",font=FONT).pack(side="left",padx=4)
         # Control
         cf=card(2,"Control")
         ctk.CTkSwitch(cf,text="Paper Mode (safe)",variable=self.paper_var,font=FONT,
@@ -858,13 +1064,14 @@ class App(ctk.CTk):
             self._set_status("Generate token first (Connection tab)",RD)
             self._nb.set("Connection"); return
         cid=self._token_client; tok=self._access_token
-        if not (self.trade_nifty_var.get() or self.trade_sensex_var.get()):
-            self._set_status("Enable at least one index",RD); return
+        if not (self.trade_nifty_var.get() or self.trade_sensex_var.get() or self.trade_silver_var.get()):
+            self._set_status("Enable at least one instrument",RD); return
         tf=self.tf_var.get(); iv=5 if tf=="5s" else int(tf)*60
         self.engine=Engine(cid,tok,iv,max(1,self.period_var.get()),
             max(0.1,self.mult_var.get()),self.paper_var.get(),
             self.nifty_lots_var.get(),self.sensex_lots_var.get(),
             self.sq_var.get(),self.trade_nifty_var.get(),self.trade_sensex_var.get(),
+            self.trade_silver_var.get(),self.silver_lots_var.get(),
             log_fn=self._log)
         # Build tree rows
         for iid in self._tree.get_children(): self._tree.delete(iid)
@@ -872,6 +1079,9 @@ class App(ctk.CTk):
         for t in self.engine.traders:
             iid=self._tree.insert("","end",values=(t.idx["name"],"-","-","-","-","FLAT","-","-","-","-","-","Ready"))
             self._tree_ids[t.idx["name"]]=iid
+        if self.trade_silver_var.get():
+            iid=self._tree.insert("","end",values=("SILVERMICRO","-","-","-","-","FLAT","FUT","-","-","-","-","Resolving..."))
+            self._tree_ids["SILVERMICRO"]=iid
         self.engine.start(); self._running=True
         self._btn_start.configure(state="disabled",text="RUNNING ●")
         self._btn_stop.configure(state="normal")
@@ -913,6 +1123,24 @@ class App(ctk.CTk):
                     f"{t.opt_ltp:.2f}" if t.opt_ltp else "-",
                     f"₹{pnl:+.2f}" if t.position!="FLAT" else "-",
                     t.bar_time, t.status), tags=tag)
+            # Render future traders (Silver)
+            for f in self.engine.futures:
+                iid=self._tree_ids.get(f.name)
+                if not iid: continue
+                pnl=f.pnl; total+=pnl
+                tag=("green",) if f.st_dir=="GREEN" else (("red",) if f.st_dir=="RED" else ())
+                self._tree.item(iid,values=(
+                    f.name,
+                    f"{f.ltp:.2f}" if f.ltp else "-",
+                    f"{f.st_value:.2f}" if f.st_value else "-",
+                    f.st_dir,
+                    f"{f.atr:.2f}" if f.atr else "-",
+                    f.position,
+                    "FUT",
+                    f"{f.entry:.2f}" if f.entry else "-",
+                    f"{f.ltp:.2f}" if f.ltp else "-",
+                    f"₹{pnl:+.2f}" if f.position!="FLAT" else "-",
+                    f.bar_time, f.status), tags=tag)
             c=GR if total>0 else (RD if total<0 else GOLD)
             self._lbl_pnl.configure(text=f"Net P&L: ₹{total:+,.2f}",text_color=c)
         self.after(500,self._tick)

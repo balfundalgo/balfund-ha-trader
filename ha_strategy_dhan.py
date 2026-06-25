@@ -114,52 +114,60 @@ class CandleAgg:
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_supertrend(candles: List[dict], period: int, mult: float) -> List[dict]:
     """
-    Returns list of {bucket, st, dir} where dir is 'GREEN'(up) or 'RED'(down).
-    ChartIQ Supertrend:
-      TR  = max(H-L, |H-prevC|, |L-prevC|)
-      ATR = Wilder RMA of TR: ATR(i) = (ATR(i-1)*(p-1) + TR(i)) / p
-      basicUpper = (H+L)/2 + mult*ATR ; basicLower = (H+L)/2 - mult*ATR
-      finalUpper/finalLower ratchet; direction flips on close cross.
+    Supertrend — exact TradingView / Dhan logic (matches reference MQL5 EA).
+      TR     = max(H-L, |H-prevC|, |L-prevC|)   (first bar = H-L)
+      ATR    = RMA: ATR(i) = alpha*TR(i) + (1-alpha)*ATR(i-1),  alpha = 1/period
+               (seeded with SMA of first `period` TRs)
+      hl2    = (H+L)/2
+      basicUpper = hl2 + factor*ATR ; basicLower = hl2 - factor*ATR
+      upperBand(i) = basicUpper if basicUpper<prevUpper OR prevClose>prevUpper else prevUpper
+      lowerBand(i) = basicLower if basicLower>prevLower OR prevClose<prevLower else prevLower
+      direction:
+        if prevDir==UP:   flip DOWN if close < lowerBand(i)  else stay UP
+        if prevDir==DOWN: flip UP   if close > upperBand(i)  else stay DOWN
+      ST line = lowerBand when UP (GREEN), upperBand when DOWN (RED)
     """
     n=len(candles)
     if n<period+1: return []
-    # True Range
+    alpha=1.0/period
+
+    # True Range (index 0 has no previous close → H-L)
     tr=[0.0]*n
+    tr[0]=candles[0]["high"]-candles[0]["low"]
     for i in range(1,n):
         h=candles[i]["high"]; l=candles[i]["low"]; pc=candles[i-1]["close"]
         tr[i]=max(h-l, abs(h-pc), abs(l-pc))
-    # ATR (Wilder): seed with SMA of first `period` TRs
+
+    # ATR via RMA, seeded with SMA of first `period` TRs at index (period-1)
     atr=[0.0]*n
-    seed=sum(tr[1:period+1])/period
-    atr[period]=seed
-    for i in range(period+1,n):
-        atr[i]=(atr[i-1]*(period-1)+tr[i])/period
-    # Bands + direction
-    out=[]
-    fu=fl=0.0; st=0.0; direction="GREEN"
-    prev_fu=prev_fl=0.0; prev_st=0.0
-    started=False
+    atr[period-1]=sum(tr[0:period])/period
     for i in range(period,n):
-        h=candles[i]["high"]; l=candles[i]["low"]; c=candles[i]["close"]; pc=candles[i-1]["close"]
+        atr[i]=alpha*tr[i]+(1.0-alpha)*atr[i-1]
+
+    out=[]
+    prev_upper=prev_lower=0.0
+    prev_close=0.0
+    prev_dir=1   # 1 = up (GREEN), -1 = down (RED)
+    for i in range(period-1,n):
+        h=candles[i]["high"]; l=candles[i]["low"]; c=candles[i]["close"]
         hl2=(h+l)/2.0
         bu=hl2+mult*atr[i]
         bl=hl2-mult*atr[i]
-        if not started:
-            fu=bu; fl=bl; direction="GREEN" if c>=hl2 else "RED"
-            st=fl if direction=="GREEN" else fu
-            started=True
+        if i==period-1:
+            # First computed bar — initialize bands & direction
+            upper=bu; lower=bl
+            direction = 1 if c>=hl2 else -1
         else:
-            fu = bu if (bu<prev_fu or pc>prev_fu) else prev_fu
-            fl = bl if (bl>prev_fl or pc<prev_fl) else prev_fl
-            # Determine direction based on previous supertrend line
-            if prev_st==prev_fu:   # was in downtrend (RED)
-                direction = "GREEN" if c>fu else "RED"
-            else:                  # was in uptrend (GREEN)
-                direction = "RED" if c<fl else "GREEN"
-            st = fl if direction=="GREEN" else fu
+            upper = bu if (bu<prev_upper or prev_close>prev_upper) else prev_upper
+            lower = bl if (bl>prev_lower or prev_close<prev_lower) else prev_lower
+            if prev_dir==1:
+                direction = -1 if c<lower else 1
+            else:
+                direction = 1 if c>upper else -1
+        st = lower if direction==1 else upper
         out.append({"bucket":candles[i]["bucket"],"st":round(st,2),
-                    "dir":direction,"atr":round(atr[i],2)})
-        prev_fu=fu; prev_fl=fl; prev_st=st
+                    "dir":"GREEN" if direction==1 else "RED","atr":round(atr[i],4)})
+        prev_upper=upper; prev_lower=lower; prev_close=c; prev_dir=direction
     return out
 
 # ══════════════════════════════════════════════════════════════════════════════

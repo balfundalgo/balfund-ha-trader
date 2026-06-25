@@ -260,6 +260,25 @@ def load_master(log_fn=print):
     MASTER_CACHE.write_text(raw,encoding="utf-8")
     return list(csv.DictReader(io.StringIO(raw)))
 
+def build_fno_lot_index(rows) -> Dict[str,int]:
+    """Build {security_id → lot_size} for all NSE/BSE F&O option/future rows.
+       Lot size comes from SEM_LOT_UNITS — always current, never hardcoded."""
+    idx={}
+    for row in rows:
+        seg=row.get("SEM_SEGMENT","").strip().upper()
+        exch=row.get("SEM_EXM_EXCH_ID","").strip().upper()
+        # F&O segments: NSE F&O, BSE F&O
+        if seg not in ("D","E","FNO") and "FNO" not in seg and exch not in ("NSE","BSE","MCX"):
+            pass  # keep broad; we filter by lot presence below
+        sid=row.get("SEM_SMST_SECURITY_ID","").strip()
+        lot=row.get("SEM_LOT_UNITS","").strip()
+        if not sid or not lot: continue
+        try: lot_i=int(float(lot))
+        except: continue
+        if lot_i>0:
+            idx[sid]=lot_i
+    return idx
+
 def resolve_mcx_future(rows, sym, log_fn=print) -> Optional[dict]:
     """Resolve nearest-expiry MCX futures contract security id for a commodity."""
     today=date.today(); safe=today+timedelta(days=2)
@@ -293,12 +312,25 @@ def resolve_mcx_future(rows, sym, log_fn=print) -> Optional[dict]:
 #  OPTION CHAIN  (cached + rate-limited)
 # ══════════════════════════════════════════════════════════════════════════════
 class OptionResolver:
-    """Resolves ATM CE/PE security IDs. Caches expiry list and chain."""
-    def __init__(self, cid, tok, log_fn):
+    """Resolves ATM CE/PE security IDs. Caches expiry list and chain.
+       Lot size is looked up from the master CSV (SEM_LOT_UNITS) by security id,
+       so it's always current and never hardcoded."""
+    def __init__(self, cid, tok, log_fn, lot_index=None):
         self.cid=cid; self.tok=tok; self.log=log_fn
         self._exp_cache: Dict[str,Tuple[float,list]] = {}      # idx_name → (ts, [expiries])
         self._chain_cache: Dict[str,Tuple[float,dict]] = {}    # f"{idx}:{expiry}" → (ts, oc)
+        self._lot_index: Dict[str,int] = lot_index or {}       # security_id → lot_size
         self._lock=threading.Lock()
+
+    def set_lot_index(self, lot_index: Dict[str,int]):
+        self._lot_index = lot_index or {}
+
+    def _lot_for(self, sid: str, idx) -> int:
+        """Lot size from master CSV by security id; fall back to chain default."""
+        lot=self._lot_index.get(str(sid))
+        if lot and lot>0:
+            return lot
+        return 0   # 0 signals 'unknown' → caller logs and skips
 
     def _hdrs(self):
         return {"Content-Type":"application/json","access-token":self.tok,"client-id":self.cid}
@@ -351,10 +383,21 @@ class OptionResolver:
             side=row.get("ce" if opt_type=="CE" else "pe",{})
             sid=str(side.get("security_id",""))
             ltp=float(side.get("last_price",0))
-            lot=int(d.get("data",{}).get("lot_size", 75 if idx["name"]=="NIFTY" else 20))
-            if not sid: return None
+            if not sid:
+                self.log(f"[{idx['name']}] No security_id for {strike} {opt_type} @ {expiry}")
+                return None
+            # Lot size from master CSV (always current). Chain may also carry it.
+            lot=self._lot_for(sid, idx)
+            if lot<=0:
+                # last resort: chain-provided lot fields, then known current defaults
+                lot=int(side.get("lot_size",0) or d.get("data",{}).get("lot_size",0) or 0)
+            if lot<=0:
+                self.log(f"[{idx['name']}] ⚠ Lot size not found for sid={sid} — "
+                         f"order skipped to avoid invalid qty")
+                return None
             datestr=expiry.replace("-","")
             sym=f"{idx['name']}{datestr}{strike}{opt_type}"
+            self.log(f"[{idx['name']}] ATM {opt_type} {strike} sid={sid} lot={lot} ltp={ltp}")
             return {"sid":sid,"sym":sym,"ltp":ltp,"lot":lot,"strike":strike,"expiry":expiry}
         except Exception as e:
             self.log(f"[{idx['name']}] Option resolve error: {e}")
@@ -717,10 +760,25 @@ class Engine:
 
     def _run(self):
         rest_iv="1" if self.iv_sec<=60 else "5" if self.iv_sec<=300 else "15"
-        # Resolve SILVERMICRO future from master CSV
-        if self._trade_silver:
+        # Load master CSV once if we trade options (for lot sizes) or silver
+        rows=None
+        need_master = bool(self.traders) or self._trade_silver
+        if need_master:
             try:
                 rows=load_master(self.log)
+            except Exception as e:
+                self.log(f"[Master CSV ERR] {e}")
+        # Build option lot-size index (security_id → lot) and hand to resolver
+        if self.traders and rows:
+            try:
+                lot_index=build_fno_lot_index(rows)
+                self.resolver.set_lot_index(lot_index)
+                self.log(f"[Engine] Lot-size index built — {len(lot_index)} contracts")
+            except Exception as e:
+                self.log(f"[Lot index ERR] {e}")
+        # Resolve SILVERMICRO future from master CSV
+        if self._trade_silver and rows:
+            try:
                 info=resolve_mcx_future(rows,"SILVERMICRO",self.log)
                 if info:
                     ft=FutureTrader(SILVER,info["sid"],info["lot"],self._silver_lots,

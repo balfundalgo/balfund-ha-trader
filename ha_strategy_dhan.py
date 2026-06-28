@@ -35,8 +35,8 @@ MASTER_URL    = "https://images.dhan.co/api-data/api-scrip-master.csv"
 WS_URL        = "wss://api-feed.dhan.co?version=2&token={tok}&clientId={cid}&authType=2"
 
 # Index spot definitions (confirmed from DhanHQ SDK)
-NIFTY  = {"name":"NIFTY",  "sid":"13", "seg":"IDX_I", "step":50,  "opt_seg":"NSE_FNO", "u_scrip":13, "u_seg":"IDX_I"}
-SENSEX = {"name":"SENSEX", "sid":"51", "seg":"IDX_I", "step":100, "opt_seg":"BSE_FNO", "u_scrip":51, "u_seg":"IDX_I"}
+NIFTY  = {"name":"NIFTY",  "sid":"13", "seg":"IDX_I", "step":50,  "opt_seg":"NSE_FNO", "u_scrip":13, "u_seg":"IDX_I", "lot_default":65}
+SENSEX = {"name":"SENSEX", "sid":"51", "seg":"IDX_I", "step":100, "opt_seg":"BSE_FNO", "u_scrip":51, "u_seg":"IDX_I", "lot_default":20}
 
 # MCX futures definitions (security id + expiry resolved from master CSV at runtime)
 # key = internal name, "match" = symbol prefixes to match in SEM_TRADING_SYMBOL
@@ -270,22 +270,23 @@ def load_master(log_fn=print, force=False):
     return list(csv.DictReader(io.StringIO(raw)))
 
 def build_fno_lot_index(rows) -> Dict[str,int]:
-    """Build {security_id → lot_size} for all NSE/BSE F&O option/future rows.
-       Lot size comes from SEM_LOT_UNITS — always current, never hardcoded."""
+    """Build {security_id → lot_size} for all F&O option/future rows.
+       Lot size comes from SEM_LOT_UNITS. Keys by every id-like column present,
+       so BSE (SENSEX) options resolve even if the option-chain sid maps to a
+       different id field than NSE."""
     idx={}
+    id_cols=["SEM_SMST_SECURITY_ID","SEM_EXCH_INSTRUMENT_ID","SEM_INSTRUMENT_ID"]
     for row in rows:
-        seg=row.get("SEM_SEGMENT","").strip().upper()
-        exch=row.get("SEM_EXM_EXCH_ID","").strip().upper()
-        # F&O segments: NSE F&O, BSE F&O
-        if seg not in ("D","E","FNO") and "FNO" not in seg and exch not in ("NSE","BSE","MCX"):
-            pass  # keep broad; we filter by lot presence below
-        sid=row.get("SEM_SMST_SECURITY_ID","").strip()
         lot=row.get("SEM_LOT_UNITS","").strip()
-        if not sid or not lot: continue
+        if not lot: continue
         try: lot_i=int(float(lot))
         except: continue
-        if lot_i>0:
-            idx[sid]=lot_i
+        if lot_i<=0: continue
+        for col in id_cols:
+            v=row.get(col,"")
+            if v:
+                v=str(v).strip()
+                if v: idx[v]=lot_i
     return idx
 
 def resolve_mcx_future(rows, fut, log_fn=print) -> Optional[dict]:
@@ -404,11 +405,16 @@ class OptionResolver:
             if not sid:
                 self.log(f"[{idx['name']}] No security_id for {strike} {opt_type} @ {expiry}")
                 return None
-            # Lot size from master CSV (always current). Chain may also carry it.
+            # Lot size: 1) master CSV by sid, 2) chain fields, 3) index default
             lot=self._lot_for(sid, idx)
             if lot<=0:
-                # last resort: chain-provided lot fields, then known current defaults
                 lot=int(side.get("lot_size",0) or d.get("data",{}).get("lot_size",0) or 0)
+            if lot<=0:
+                # Per-index current default (kept as final safety net, logged clearly)
+                lot=int(idx.get("lot_default",0))
+                if lot>0:
+                    self.log(f"[{idx['name']}] Lot not in CSV/chain for sid={sid}; "
+                             f"using known default lot={lot}")
             if lot<=0:
                 self.log(f"[{idx['name']}] ⚠ Lot size not found for sid={sid} — "
                          f"order skipped to avoid invalid qty")

@@ -269,25 +269,28 @@ def load_master(log_fn=print, force=False):
     MASTER_CACHE.write_text(raw,encoding="utf-8")
     return list(csv.DictReader(io.StringIO(raw)))
 
-def build_fno_lot_index(rows) -> Dict[str,int]:
-    """Build {security_id → lot_size} for all F&O option/future rows.
-       Lot size comes from SEM_LOT_UNITS. Keys by every id-like column present,
-       so BSE (SENSEX) options resolve even if the option-chain sid maps to a
-       different id field than NSE."""
-    idx={}
-    id_cols=["SEM_SMST_SECURITY_ID","SEM_EXCH_INSTRUMENT_ID","SEM_INSTRUMENT_ID"]
+def build_index_option_lots(rows) -> Dict[str,int]:
+    """Map underlying index name → lot size, read from its OPTIDX rows in the
+       scrip master. Robust: all strikes/expiries of one index share one lot,
+       so this never depends on matching a specific option's security_id
+       (which differs between the option-chain API and the CSV for BSE)."""
+    lots={}
+    # Order matters: match more specific names before 'NIFTY'/'SENSEX'
+    names=["MIDCPNIFTY","FINNIFTY","BANKNIFTY","NIFTYNXT50","NIFTY","SENSEX50","BANKEX","SENSEX"]
     for row in rows:
+        instr=row.get("SEM_INSTRUMENT_NAME","").strip().upper()
+        if instr!="OPTIDX": continue
         lot=row.get("SEM_LOT_UNITS","").strip()
-        if not lot: continue
         try: lot_i=int(float(lot))
         except: continue
         if lot_i<=0: continue
-        for col in id_cols:
-            v=row.get(col,"")
-            if v:
-                v=str(v).strip()
-                if v: idx[v]=lot_i
-    return idx
+        ts=row.get("SEM_TRADING_SYMBOL","").strip().upper()
+        cs=row.get("SEM_CUSTOM_SYMBOL","").strip().upper()
+        for nm in names:
+            if ts.startswith(nm) or cs.startswith(nm):
+                lots.setdefault(nm, lot_i)
+                break
+    return lots
 
 def resolve_mcx_future(rows, fut, log_fn=print) -> Optional[dict]:
     """Resolve the active (nearest non-expired) MCX futures contract.
@@ -332,24 +335,25 @@ def resolve_mcx_future(rows, fut, log_fn=print) -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 class OptionResolver:
     """Resolves ATM CE/PE security IDs. Caches expiry list and chain.
-       Lot size is looked up from the master CSV (SEM_LOT_UNITS) by security id,
-       so it's always current and never hardcoded."""
-    def __init__(self, cid, tok, log_fn, lot_index=None):
+       Lot size is read from the scrip master per underlying index (OPTIDX rows),
+       so it's always current, from the API, and never hardcoded."""
+    def __init__(self, cid, tok, log_fn, index_lots=None):
         self.cid=cid; self.tok=tok; self.log=log_fn
         self._exp_cache: Dict[str,Tuple[float,list]] = {}      # idx_name → (ts, [expiries])
         self._chain_cache: Dict[str,Tuple[float,dict]] = {}    # f"{idx}:{expiry}" → (ts, oc)
-        self._lot_index: Dict[str,int] = lot_index or {}       # security_id → lot_size
+        self._index_lots: Dict[str,int] = index_lots or {}     # underlying → lot_size
+        self._diag_done: set = set()                           # names already diagnosed
         self._lock=threading.Lock()
 
-    def set_lot_index(self, lot_index: Dict[str,int]):
-        self._lot_index = lot_index or {}
+    def set_index_lots(self, index_lots: Dict[str,int]):
+        self._index_lots = index_lots or {}
 
-    def _lot_for(self, sid: str, idx) -> int:
-        """Lot size from master CSV by security id; fall back to chain default."""
-        lot=self._lot_index.get(str(sid))
+    def _lot_for(self, idx) -> int:
+        """Lot size from scrip master, by underlying index name."""
+        lot=self._index_lots.get(idx["name"].upper())
         if lot and lot>0:
             return lot
-        return 0   # 0 signals 'unknown' → caller logs and skips
+        return int(idx.get("lot_default",0))   # final safety net
 
     def _hdrs(self):
         return {"Content-Type":"application/json","access-token":self.tok,"client-id":self.cid}
@@ -389,40 +393,59 @@ class OptionResolver:
         return int(round(spot/step))*step
 
     def resolve(self, idx, spot, opt_type) -> Optional[dict]:
-        """Returns {sid, sym, ltp, lot, strike} for ATM CE or PE."""
+        """Returns {sid, sym, ltp, lot, strike} for ATM CE or PE.
+           Finds the nearest available strike in the chain (robust to key
+           format / strike-interval differences between NSE and BSE)."""
         try:
             exps=self.expiries(idx)
             if not exps: return None
             expiry=exps[0]
-            strike=self.atm_strike(spot,idx["step"])
+            atm=self.atm_strike(spot,idx["step"])
             d=self.chain(idx,expiry)
-            oc=d.get("data",{}).get("oc",{})
-            key=f"{float(strike):.6f}"
-            row=oc.get(key,{})
-            side=row.get("ce" if opt_type=="CE" else "pe",{})
+            data=d.get("data",{})
+            oc=data.get("oc",{})
+            if not oc:
+                self.log(f"[{idx['name']}] Empty option chain for {expiry}")
+                return None
+            # One-time diagnostic per index: show what the chain actually contains
+            if idx["name"] not in self._diag_done:
+                self._diag_done.add(idx["name"])
+                sample=list(oc.keys())[:3]
+                self.log(f"[{idx['name']}] chain spot(data.last_price)={data.get('last_price')} "
+                         f"strikes={len(oc)} sample_keys={sample}")
+            side_key="ce" if opt_type=="CE" else "pe"
+            # Pick nearest strike that has the requested side with a valid security_id
+            best=None; best_diff=None
+            for k,node in oc.items():
+                try: ks=float(k)
+                except: continue
+                sd=node.get(side_key) or {}
+                if not sd.get("security_id"): continue
+                diff=abs(ks-atm)
+                if best_diff is None or diff<best_diff:
+                    best_diff=diff; best=(ks,sd)
+            if not best:
+                self.log(f"[{idx['name']}] No {opt_type} strike with security_id near {atm}")
+                return None
+            strike,side=best
             sid=str(side.get("security_id",""))
-            ltp=float(side.get("last_price",0))
-            if not sid:
-                self.log(f"[{idx['name']}] No security_id for {strike} {opt_type} @ {expiry}")
+            ltp=float(side.get("last_price",0) or 0)
+            # If premium is 0/stale, fall back to average_price then bid/ask mid
+            if ltp<=0:
+                ltp=float(side.get("average_price",0) or 0)
+            if ltp<=0:
+                bid=float(side.get("top_bid_price",0) or 0); ask=float(side.get("top_ask_price",0) or 0)
+                if bid>0 and ask>0: ltp=round((bid+ask)/2,2)
+            # Lot size from scrip master per underlying (from API, never hardcoded)
+            lot=self._lot_for(idx)
+            if lot<=0:
+                self.log(f"[{idx['name']}] ⚠ Lot size unavailable — order skipped")
                 return None
-            # Lot size: 1) master CSV by sid, 2) chain fields, 3) index default
-            lot=self._lot_for(sid, idx)
-            if lot<=0:
-                lot=int(side.get("lot_size",0) or d.get("data",{}).get("lot_size",0) or 0)
-            if lot<=0:
-                # Per-index current default (kept as final safety net, logged clearly)
-                lot=int(idx.get("lot_default",0))
-                if lot>0:
-                    self.log(f"[{idx['name']}] Lot not in CSV/chain for sid={sid}; "
-                             f"using known default lot={lot}")
-            if lot<=0:
-                self.log(f"[{idx['name']}] ⚠ Lot size not found for sid={sid} — "
-                         f"order skipped to avoid invalid qty")
-                return None
+            strike_i=int(strike) if float(strike).is_integer() else strike
             datestr=expiry.replace("-","")
-            sym=f"{idx['name']}{datestr}{strike}{opt_type}"
-            self.log(f"[{idx['name']}] ATM {opt_type} {strike} sid={sid} lot={lot} ltp={ltp}")
-            return {"sid":sid,"sym":sym,"ltp":ltp,"lot":lot,"strike":strike,"expiry":expiry}
+            sym=f"{idx['name']}{datestr}{strike_i}{opt_type}"
+            self.log(f"[{idx['name']}] ATM {opt_type} {strike_i} sid={sid} lot={lot} ltp={ltp}")
+            return {"sid":sid,"sym":sym,"ltp":ltp,"lot":lot,"strike":strike_i,"expiry":expiry}
         except Exception as e:
             self.log(f"[{idx['name']}] Option resolve error: {e}")
             return None
@@ -794,14 +817,15 @@ class Engine:
                 rows=load_master(self.log)
             except Exception as e:
                 self.log(f"[Master CSV ERR] {e}")
-        # Build option lot-size index (security_id → lot) and hand to resolver
+        # Build per-underlying index option lot map and hand to resolver
         if self.traders and rows:
             try:
-                lot_index=build_fno_lot_index(rows)
-                self.resolver.set_lot_index(lot_index)
-                self.log(f"[Engine] Lot-size index built — {len(lot_index)} contracts")
+                index_lots=build_index_option_lots(rows)
+                self.resolver.set_index_lots(index_lots)
+                shown={k:index_lots[k] for k in ("NIFTY","SENSEX") if k in index_lots}
+                self.log(f"[Engine] Index option lots from scrip master: {shown or index_lots}")
             except Exception as e:
-                self.log(f"[Lot index ERR] {e}")
+                self.log(f"[Lot map ERR] {e}")
         # Resolve each selected MCX future (auto-rolls to active expiry)
         if self._mcx_selections and rows:
             for name, lots in self._mcx_selections.items():

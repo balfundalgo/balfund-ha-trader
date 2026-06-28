@@ -38,8 +38,14 @@ WS_URL        = "wss://api-feed.dhan.co?version=2&token={tok}&clientId={cid}&aut
 NIFTY  = {"name":"NIFTY",  "sid":"13", "seg":"IDX_I", "step":50,  "opt_seg":"NSE_FNO", "u_scrip":13, "u_seg":"IDX_I"}
 SENSEX = {"name":"SENSEX", "sid":"51", "seg":"IDX_I", "step":100, "opt_seg":"BSE_FNO", "u_scrip":51, "u_seg":"IDX_I"}
 
-# MCX futures definitions (security id resolved from master CSV at runtime)
-SILVER = {"name":"SILVERMICRO", "seg":"MCX_COMM", "lot_mult":1}
+# MCX futures definitions (security id + expiry resolved from master CSV at runtime)
+# key = internal name, "match" = symbol prefixes to match in SEM_TRADING_SYMBOL
+MCX_FUTURES = {
+    "SILVERMICRO":   {"name":"SILVERMICRO",   "seg":"MCX_COMM", "match":["SILVERMIC"]},
+    "ZINCMINI":      {"name":"ZINCMINI",      "seg":"MCX_COMM", "match":["ZINCMINI"]},
+    "NATGASMINI":    {"name":"NATGASMINI",    "seg":"MCX_COMM", "match":["NATGASMINI"]},
+    "GOLDPETAL":     {"name":"GOLDPETAL",     "seg":"MCX_COMM", "match":["GOLDPETAL"]},
+}
 
 # WS packet
 REQ_SUB         = 15
@@ -243,15 +249,18 @@ def fetch_ohlc(cid, tok, sid, seg, iv, days=5, instrument="INDEX"):
 # ══════════════════════════════════════════════════════════════════════════════
 #  MASTER CSV + MCX FUTURES RESOLVER
 # ══════════════════════════════════════════════════════════════════════════════
-def load_master(log_fn=print):
-    if MASTER_CACHE.exists():
-        age=(time.time()-MASTER_CACHE.stat().st_mtime)/3600
-        if age<12:
-            log_fn(f"  Using cached master CSV ({age:.1f}h old)")
+def load_master(log_fn=print, force=False):
+    if MASTER_CACHE.exists() and not force:
+        mtime=MASTER_CACHE.stat().st_mtime
+        age_h=(time.time()-mtime)/3600
+        same_day=date.fromtimestamp(mtime)==date.today()
+        # Use cache only if it's fresh AND from today (so expiries roll daily)
+        if age_h<12 and same_day:
+            log_fn(f"  Using cached master CSV ({age_h:.1f}h old, today)")
             raw=MASTER_CACHE.read_text(encoding="utf-8",errors="ignore")
             if raw.startswith("\ufeff"): raw=raw[1:]
             return list(csv.DictReader(io.StringIO(raw)))
-    log_fn("  Downloading master CSV...")
+    log_fn("  Downloading fresh master CSV...")
     r=requests.get(MASTER_URL,stream=True,timeout=120); r.raise_for_status()
     buf=io.BytesIO()
     for chunk in r.iter_content(65536): buf.write(chunk)
@@ -279,34 +288,43 @@ def build_fno_lot_index(rows) -> Dict[str,int]:
             idx[sid]=lot_i
     return idx
 
-def resolve_mcx_future(rows, sym, log_fn=print) -> Optional[dict]:
-    """Resolve nearest-expiry MCX futures contract security id for a commodity."""
-    today=date.today(); safe=today+timedelta(days=2)
+def resolve_mcx_future(rows, fut, log_fn=print) -> Optional[dict]:
+    """Resolve the active (nearest non-expired) MCX futures contract.
+       `fut` is an entry from MCX_FUTURES with 'name' and 'match' prefixes.
+       Auto-rolls: once a contract's expiry date passes, the next month is
+       picked automatically on the next resolve."""
+    today=date.today()
     MONTHS={"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
             "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-    variants=[sym.upper(), sym.upper().replace("MICRO","MIC"), sym.upper().replace("MINI","")]
+    name=fut["name"]; prefixes=[p.upper() for p in fut["match"]]
     found=[]
     for row in rows:
         if row.get("SEM_EXM_EXCH_ID","").strip().upper()!="MCX": continue
         ts=row.get("SEM_TRADING_SYMBOL","").strip().upper()
         if not ts.endswith("-FUT"): continue
-        if not any(ts.startswith(v) for v in variants): continue
+        # Match the commodity base (before the first '-') — exact match only
+        base=ts.split("-")[0]
+        if base not in prefixes: continue
         m=re.search(r"(\d{2})([A-Z]{3})(\d{4})",ts)
         if not m: continue
         try: exp=date(int(m.group(3)),MONTHS[m.group(2)],int(m.group(1)))
         except: continue
         sid=row.get("SEM_SMST_SECURITY_ID","").strip()
         lot=row.get("SEM_LOT_UNITS","").strip()
-        found.append((exp,sid,ts,lot))
-    active=sorted([x for x in found if x[0]>=safe],key=lambda x:x[0])
-    if not active: active=sorted([x for x in found if x[0]>=today],key=lambda x:x[0])
+        if not sid: continue
+        found.append((exp,sid,ts,lot,base))
+    if not found:
+        log_fn(f"  ✗ {name}: no futures contract found in master CSV"); return None
+    # Active = nearest expiry that is today or later (MCX trades until EOD on expiry day)
+    active=sorted([x for x in found if x[0]>=today],key=lambda x:x[0])
     if not active:
-        log_fn(f"  ✗ {sym} futures contract not found"); return None
-    e,sid,ts,lot=active[0]
+        log_fn(f"  ✗ {name}: all contracts expired — master CSV may be stale"); return None
+    e,sid,ts,lot,base=active[0]
     try: lot_i=int(float(lot))
     except: lot_i=1
-    log_fn(f"  ✓ {sym} sid={sid}  {ts}  expiry={e}  lot={lot_i}")
-    return {"sid":sid,"ts":ts,"expiry":str(e),"lot":lot_i}
+    days_left=(e-today).days
+    log_fn(f"  ✓ {name} sid={sid}  {ts}  expiry={e} ({days_left}d left)  lot={lot_i}")
+    return {"sid":sid,"ts":ts,"expiry":str(e),"lot":lot_i,"name":name,"days_left":days_left}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OPTION CHAIN  (cached + rate-limited)
@@ -636,6 +654,7 @@ class FutureTrader:
         self.st_value=0.0; self.st_dir="-"; self.atr=0.0
         self.position="FLAT"          # FLAT / LONG / SHORT
         self.entry=0.0; self.bar_time="-"; self.status="Waiting"; self.strike=0
+        self.expiry="-"
         self._startup_done=False; self._lock=threading.Lock()
 
     @property
@@ -697,7 +716,8 @@ class FutureTrader:
 class Engine:
     def __init__(self, cid, tok, iv_sec, period, mult, paper,
                  nifty_lots, sensex_lots, sq_time, trade_nifty, trade_sensex,
-                 trade_silver, silver_lots, log_fn):
+                 mcx_selections, log_fn):
+        # mcx_selections: dict name → lots, e.g. {"SILVERMICRO":1, "ZINCMINI":2}
         self.cid=cid; self.tok=tok; self.iv_sec=iv_sec
         self.period=period; self.mult=mult; self.paper=paper
         self.sq_time=sq_time; self.log=log_fn
@@ -725,7 +745,7 @@ class Engine:
             self.feed.add_sub(t.idx["sid"], t.idx["seg"])
 
         # Future traders (resolved later in _run after master CSV loads)
-        self._trade_silver=trade_silver; self._silver_lots=silver_lots
+        self._mcx_selections={k:v for k,v in (mcx_selections or {}).items() if v and v>0}
         self.futures: List[FutureTrader]=[]
         self._fut_map: Dict[str,FutureTrader]={}
 
@@ -760,9 +780,9 @@ class Engine:
 
     def _run(self):
         rest_iv="1" if self.iv_sec<=60 else "5" if self.iv_sec<=300 else "15"
-        # Load master CSV once if we trade options (for lot sizes) or silver
+        # Load master CSV once if we trade options (for lot sizes) or any MCX future
         rows=None
-        need_master = bool(self.traders) or self._trade_silver
+        need_master = bool(self.traders) or bool(self._mcx_selections)
         if need_master:
             try:
                 rows=load_master(self.log)
@@ -776,20 +796,24 @@ class Engine:
                 self.log(f"[Engine] Lot-size index built — {len(lot_index)} contracts")
             except Exception as e:
                 self.log(f"[Lot index ERR] {e}")
-        # Resolve SILVERMICRO future from master CSV
-        if self._trade_silver and rows:
-            try:
-                info=resolve_mcx_future(rows,"SILVERMICRO",self.log)
-                if info:
-                    ft=FutureTrader(SILVER,info["sid"],info["lot"],self._silver_lots,
-                        self.period,self.mult,self.paper,self.feed,
-                        self.cid,self.tok,self.log)
-                    self.futures.append(ft)
-                    self._fut_map[info["sid"]]=ft
-                    self._aggs[info["sid"]]=CandleAgg(self.iv_sec)
-                    self.feed.add_sub(info["sid"], SILVER["seg"])
-            except Exception as e:
-                self.log(f"[Silver resolve ERR] {e}")
+        # Resolve each selected MCX future (auto-rolls to active expiry)
+        if self._mcx_selections and rows:
+            for name, lots in self._mcx_selections.items():
+                fut=MCX_FUTURES.get(name)
+                if not fut: continue
+                try:
+                    info=resolve_mcx_future(rows, fut, self.log)
+                    if info:
+                        ft=FutureTrader(fut,info["sid"],info["lot"],lots,
+                            self.period,self.mult,self.paper,self.feed,
+                            self.cid,self.tok,self.log)
+                        ft.expiry=info["expiry"]
+                        self.futures.append(ft)
+                        self._fut_map[info["sid"]]=ft
+                        self._aggs[info["sid"]]=CandleAgg(self.iv_sec)
+                        self.feed.add_sub(info["sid"], fut["seg"])
+                except Exception as e:
+                    self.log(f"[{name} resolve ERR] {e}")
 
         self.log(f"[Engine] Seeding {len(self.traders)} indices + {len(self.futures)} futures...")
         # Seed index spots
@@ -888,8 +912,13 @@ class App(ctk.CTk):
         self.sensex_lots_var=ctk.IntVar(value=_s.get("sensex_lots",1))
         self.trade_nifty_var=ctk.BooleanVar(value=_s.get("trade_nifty",True))
         self.trade_sensex_var=ctk.BooleanVar(value=_s.get("trade_sensex",True))
-        self.trade_silver_var=ctk.BooleanVar(value=_s.get("trade_silver",False))
-        self.silver_lots_var=ctk.IntVar(value=_s.get("silver_lots",1))
+        # MCX futures toggles + lots
+        self.mcx_vars={}   # name → (BooleanVar trade, IntVar lots)
+        _mcx_saved=_s.get("mcx",{})
+        for _name in MCX_FUTURES:
+            tv=ctk.BooleanVar(value=_mcx_saved.get(_name,{}).get("trade",False))
+            lv=ctk.IntVar(value=_mcx_saved.get(_name,{}).get("lots",1))
+            self.mcx_vars[_name]=(tv,lv)
         self.sq_var=ctk.StringVar(value=_s.get("sq","15:15"))
 
         self._build()
@@ -925,7 +954,7 @@ class App(ctk.CTk):
                 "mult":self.mult_var.get(),"paper":self.paper_var.get(),
                 "nifty_lots":self.nifty_lots_var.get(),"sensex_lots":self.sensex_lots_var.get(),
                 "trade_nifty":self.trade_nifty_var.get(),"trade_sensex":self.trade_sensex_var.get(),
-                "trade_silver":self.trade_silver_var.get(),"silver_lots":self.silver_lots_var.get(),
+                "mcx":{n:{"trade":tv.get(),"lots":lv.get()} for n,(tv,lv) in self.mcx_vars.items()},
                 "sq":self.sq_var.get()},indent=2))
         except: pass
     def _on_close(self): self._save(); self._save_creds(); self.destroy()
@@ -1057,11 +1086,13 @@ class App(ctk.CTk):
         ctk.CTkLabel(r2,text="SENSEX lots:",width=110,anchor="w",font=FONT,text_color=TD).pack(side="left")
         ctk.CTkEntry(r2,textvariable=self.sensex_lots_var,width=60,justify="center",font=FONT).pack(side="left",padx=4)
         ctk.CTkFrame(ix,fg_color=BD,height=1).pack(fill="x",padx=12,pady=6)
-        ctk.CTkSwitch(ix,text="Trade SILVERMICRO (Fut)",variable=self.trade_silver_var,font=FONT,
-            button_color=AC,progress_color=ACL).pack(anchor="w",padx=12,pady=4)
-        r3=ctk.CTkFrame(ix,fg_color="transparent"); r3.pack(fill="x",padx=14,pady=2)
-        ctk.CTkLabel(r3,text="SILVER lots:",width=110,anchor="w",font=FONT,text_color=TD).pack(side="left")
-        ctk.CTkEntry(r3,textvariable=self.silver_lots_var,width=60,justify="center",font=FONT).pack(side="left",padx=4)
+        ctk.CTkLabel(ix,text="MCX Futures (long/short)",font=FONT,text_color=AC).pack(anchor="w",padx=12,pady=(2,2))
+        for _name,(tv,lv) in self.mcx_vars.items():
+            row=ctk.CTkFrame(ix,fg_color="transparent"); row.pack(fill="x",padx=12,pady=1)
+            ctk.CTkSwitch(row,text=_name,variable=tv,font=FONT,width=150,
+                button_color=AC,progress_color=ACL).pack(side="left")
+            ctk.CTkEntry(row,textvariable=lv,width=50,justify="center",font=FONT).pack(side="left",padx=4)
+            ctk.CTkLabel(row,text="lots",font=("Segoe UI",10,"bold"),text_color=GY).pack(side="left")
         # Control
         cf=card(2,"Control")
         ctk.CTkSwitch(cf,text="Paper Mode (safe)",variable=self.paper_var,font=FONT,
@@ -1130,14 +1161,16 @@ class App(ctk.CTk):
             self._set_status("Generate token first (Connection tab)",RD)
             self._nb.set("Connection"); return
         cid=self._token_client; tok=self._access_token
-        if not (self.trade_nifty_var.get() or self.trade_sensex_var.get() or self.trade_silver_var.get()):
+        mcx_sel={n:lv.get() for n,(tv,lv) in self.mcx_vars.items() if tv.get()}
+        any_index=self.trade_nifty_var.get() or self.trade_sensex_var.get()
+        if not (any_index or mcx_sel):
             self._set_status("Enable at least one instrument",RD); return
         tf=self.tf_var.get(); iv=5 if tf=="5s" else int(tf)*60
         self.engine=Engine(cid,tok,iv,max(1,self.period_var.get()),
             max(0.1,self.mult_var.get()),self.paper_var.get(),
             self.nifty_lots_var.get(),self.sensex_lots_var.get(),
             self.sq_var.get(),self.trade_nifty_var.get(),self.trade_sensex_var.get(),
-            self.trade_silver_var.get(),self.silver_lots_var.get(),
+            mcx_sel,
             log_fn=self._log)
         # Build tree rows
         for iid in self._tree.get_children(): self._tree.delete(iid)
@@ -1145,9 +1178,9 @@ class App(ctk.CTk):
         for t in self.engine.traders:
             iid=self._tree.insert("","end",values=(t.idx["name"],"-","-","-","-","FLAT","-","-","-","-","-","Ready"))
             self._tree_ids[t.idx["name"]]=iid
-        if self.trade_silver_var.get():
-            iid=self._tree.insert("","end",values=("SILVERMICRO","-","-","-","-","FLAT","FUT","-","-","-","-","Resolving..."))
-            self._tree_ids["SILVERMICRO"]=iid
+        for name in mcx_sel:
+            iid=self._tree.insert("","end",values=(name,"-","-","-","-","FLAT","FUT","-","-","-","-","Resolving..."))
+            self._tree_ids[name]=iid
         self.engine.start(); self._running=True
         self._btn_start.configure(state="disabled",text="RUNNING ●")
         self._btn_stop.configure(state="normal")

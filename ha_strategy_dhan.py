@@ -915,7 +915,18 @@ class Engine:
             tr.on_opt_tick(sid, ltp)
 
     def _run(self):
-        rest_iv="1" if self.iv_sec<=60 else "5" if self.iv_sec<=300 else "15"
+        # Seed timeframe must MATCH the trading timeframe so the candle series is
+        # consistent. Dhan REST gives 1/5/15-min (no sub-minute). For 5s we cannot
+        # fetch true 5s history, so we build it live (broker does the same).
+        iv=self.iv_sec
+        if iv==5:
+            rest_iv=None          # no historical seed possible for 5s
+        elif iv==60:
+            rest_iv="1"
+        elif iv==300:
+            rest_iv="5"
+        else:
+            rest_iv="15"
         # Load master CSV once if we trade options (for lot sizes) or any MCX future
         rows=None
         need_master = bool(self.traders) or bool(self._mcx_selections)
@@ -952,23 +963,36 @@ class Engine:
                 except Exception as e:
                     self.log(f"[{name} resolve ERR] {e}")
 
+        if rest_iv is None:
+            self.log(f"[Engine] 5s timeframe — no historical seed (REST min is 1m). "
+                     f"Building candles live; Supertrend stabilises after a few minutes.")
         self.log(f"[Engine] Seeding {len(self.traders)} indices + {len(self.futures)} futures...")
-        # Seed index spots
+        # Seed index spots (full history, no clipping — RMA needs depth to converge)
         for t in self.traders:
             try:
-                c=fetch_ohlc(self.cid,self.tok,t.idx["sid"],t.idx["seg"],rest_iv,instrument="INDEX")
-                self._aggs[t.idx["sid"]]=CandleAgg(self.iv_sec,c[-200:])
+                if rest_iv is None:
+                    self._aggs[t.idx["sid"]]=CandleAgg(self.iv_sec)
+                    self.log(f"[seed] {t.idx['name']} live-only (5s)")
+                    continue
+                c=fetch_ohlc(self.cid,self.tok,t.idx["sid"],t.idx["seg"],rest_iv,
+                             days=10,instrument="INDEX")
+                self._aggs[t.idx["sid"]]=CandleAgg(self.iv_sec,c)
                 if c: t.spot=float(c[-1]["close"])
-                self.log(f"[seed] {t.idx['name']} {len(c)} bars  spot={t.spot:.2f}")
+                self.log(f"[seed] {t.idx['name']} {len(c)} bars ({rest_iv}m)  spot={t.spot:.2f}")
             except Exception as e:
                 self.log(f"[seed ERR] {t.idx['name']}: {e}")
         # Seed futures
         for f in self.futures:
             try:
-                c=fetch_ohlc(self.cid,self.tok,f.sid,f.seg,rest_iv,instrument="FUTCOM")
-                self._aggs[f.sid]=CandleAgg(self.iv_sec,c[-200:])
+                if rest_iv is None:
+                    self._aggs[f.sid]=CandleAgg(self.iv_sec)
+                    self.log(f"[seed] {f.name} live-only (5s)")
+                    continue
+                c=fetch_ohlc(self.cid,self.tok,f.sid,f.seg,rest_iv,
+                             days=10,instrument="FUTCOM")
+                self._aggs[f.sid]=CandleAgg(self.iv_sec,c)
                 if c: f.ltp=float(c[-1]["close"])
-                self.log(f"[seed] {f.name} {len(c)} bars  ltp={f.ltp:.2f}")
+                self.log(f"[seed] {f.name} {len(c)} bars ({rest_iv}m)  ltp={f.ltp:.2f}")
             except Exception as e:
                 self.log(f"[seed ERR] {f.name}: {e}")
         self.log("[Engine] Seed done — starting WebSocket")

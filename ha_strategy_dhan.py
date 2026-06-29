@@ -3,7 +3,7 @@
 ║  BALFUND TRADING PVT. LTD.                                                ║
 ║  Supertrend NIFTY + SENSEX ATM Options Trader  v1.0                      ║
 ║                                                                          ║
-║  Signal     : ChartIQ Supertrend on index SPOT (Wilder RMA ATR)         ║
+║  Signal     : Supertrend on HEIKIN-ASHI candles (Wilder RMA ATR)        ║
 ║  Logic      : ST GREEN → buy ATM CE  |  ST RED → buy ATM PE             ║
 ║  Indices    : NIFTY (sid 13) + SENSEX (sid 51) — independent signals    ║
 ║  Timeframes : 5s / 1m / 5m / 15m  (WS-driven candles)                   ║
@@ -118,6 +118,26 @@ class CandleAgg:
         with self._l: return list(self._c)
     def ready(self,n): 
         with self._l: return len(self._c)>=n
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEIKIN-ASHI
+# ══════════════════════════════════════════════════════════════════════════════
+def heikin_ashi(candles: List[dict]) -> List[dict]:
+    """Convert regular OHLC candles to Heikin-Ashi candles.
+       HA_close = (O+H+L+C)/4
+       HA_open  = (prev HA_open + prev HA_close)/2   (seed: (O+C)/2)
+       HA_high  = max(H, HA_open, HA_close)
+       HA_low   = min(L, HA_open, HA_close)
+    """
+    ha=[]
+    for i,c in enumerate(candles):
+        o,h,l,cl=c["open"],c["high"],c["low"],c["close"]
+        ha_close=(o+h+l+cl)/4.0
+        ha_open=(o+cl)/2.0 if i==0 else (ha[-1]["open"]+ha[-1]["close"])/2.0
+        ha.append({"bucket":c["bucket"],"open":ha_open,
+                   "high":max(h,ha_open,ha_close),
+                   "low":min(l,ha_open,ha_close),"close":ha_close})
+    return ha
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SUPERTREND  (ChartIQ spec — Wilder RMA ATR)
@@ -682,7 +702,8 @@ class IndexTrader:
             with self._lock: self.opt_ltp=round(ltp,2)
 
     def process(self, candles, startup):
-        sts=compute_supertrend(candles, self.period, self.mult)
+        ha=heikin_ashi(candles)
+        sts=compute_supertrend(ha, self.period, self.mult)
         if not sts: return
         last=sts[-1]
         with self._lock:
@@ -772,7 +793,8 @@ class FutureTrader:
             with self._lock: self.ltp=round(ltp,2)
 
     def process(self, candles, startup):
-        sts=compute_supertrend(candles, self.period, self.mult)
+        ha=heikin_ashi(candles)
+        sts=compute_supertrend(ha, self.period, self.mult)
         if not sts: return
         last=sts[-1]
         with self._lock:
@@ -1003,7 +1025,7 @@ COL_W=[80,90,90,70,70,60,70,80,80,90,80,140]
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Balfund — Supertrend NIFTY+SENSEX Options  v1.0")
+        self.title("Balfund — HA Supertrend  NIFTY+SENSEX+MCX  v1.1")
         self.geometry("1300x720"); self.configure(fg_color=BG)
         self.engine: Optional[Engine]=None
         self._running=False

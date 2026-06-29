@@ -41,10 +41,14 @@ SENSEX = {"name":"SENSEX", "sid":"51", "seg":"IDX_I", "step":100, "opt_seg":"BSE
 # MCX futures definitions (security id + expiry resolved from master CSV at runtime)
 # key = internal name, "match" = symbol prefixes to match in SEM_TRADING_SYMBOL
 MCX_FUTURES = {
-    "SILVERMICRO":   {"name":"SILVERMICRO",   "seg":"MCX_COMM", "match":["SILVERMIC"]},
-    "ZINCMINI":      {"name":"ZINCMINI",      "seg":"MCX_COMM", "match":["ZINCMINI"]},
-    "NATGASMINI":    {"name":"NATGASMINI",    "seg":"MCX_COMM", "match":["NATGASMINI"]},
-    "GOLDPETAL":     {"name":"GOLDPETAL",     "seg":"MCX_COMM", "match":["GOLDPETAL"]},
+    # klass: bullion/base_metal (physically settled) or cash (Crude/NatGas).
+    # roll_days: stop opening NEW positions when days-to-expiry <= this, and
+    # auto-roll to the next contract. Buffers set 1 day before the tender period
+    # (bullion tender = 5d before expiry, base-metal tender = 3d; cash = none).
+    "SILVERMICRO": {"name":"SILVERMICRO","seg":"MCX_COMM","match":["SILVERMIC"], "klass":"bullion",    "roll_days":6},
+    "ZINCMINI":    {"name":"ZINCMINI",   "seg":"MCX_COMM","match":["ZINCMINI"],  "klass":"base_metal", "roll_days":4},
+    "NATGASMINI":  {"name":"NATGASMINI", "seg":"MCX_COMM","match":["NATGASMINI"],"klass":"cash",       "roll_days":1},
+    "GOLDPETAL":   {"name":"GOLDPETAL",  "seg":"MCX_COMM","match":["GOLDPETAL"], "klass":"bullion",    "roll_days":6},
 }
 
 # WS packet
@@ -319,15 +323,36 @@ def resolve_mcx_future(rows, fut, log_fn=print) -> Optional[dict]:
         found.append((exp,sid,ts,lot,base))
     if not found:
         log_fn(f"  ✗ {name}: no futures contract found in master CSV"); return None
-    # Active = nearest expiry that is today or later (MCX trades until EOD on expiry day)
-    active=sorted([x for x in found if x[0]>=today],key=lambda x:x[0])
-    if not active:
+    # Candidates with expiry today or later, sorted nearest first
+    cands=sorted([x for x in found if x[0]>=today],key=lambda x:x[0])
+    if not cands:
         log_fn(f"  ✗ {name}: all contracts expired — master CSV may be stale"); return None
-    e,sid,ts,lot,base=active[0]
+    roll_days=int(fut.get("roll_days",1))
+    klass=fut.get("klass","cash")
+    # Prefer the nearest contract that is SAFELY tradeable (outside tender buffer)
+    safe=[x for x in cands if (x[0]-today).days > roll_days]
+    chosen=None; rolled=False
+    if safe:
+        chosen=safe[0]
+        # Did we skip the front month because it's in/near tender?
+        if chosen is not cands[0]:
+            rolled=True
+            near=cands[0]; nd=(near[0]-today).days
+            log_fn(f"  ↻ {name}: front month {near[2]} ({nd}d left) inside "
+                   f"{klass} tender buffer ({roll_days}d) — rolling to next")
+    else:
+        # No safe contract (next month not listed yet) — use nearest, warn
+        chosen=cands[0]
+        nd=(chosen[0]-today).days
+        log_fn(f"  ⚠ {name}: only {chosen[2]} ({nd}d left) available, within "
+               f"{klass} tender buffer ({roll_days}d) — new positions may be blocked")
+    e,sid,ts,lot,base=chosen
     try: lot_i=int(float(lot))
     except: lot_i=1
     days_left=(e-today).days
-    log_fn(f"  ✓ {name} sid={sid}  {ts}  expiry={e} ({days_left}d left)  lot={lot_i}")
+    tag="↻ rolled" if rolled else "✓"
+    log_fn(f"  {tag} {name} sid={sid}  {ts}  expiry={e} ({days_left}d left)  "
+           f"lot={lot_i}  [{klass}, roll@{roll_days}d]")
     return {"sid":sid,"ts":ts,"expiry":str(e),"lot":lot_i,"name":name,"days_left":days_left}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -453,10 +478,39 @@ class OptionResolver:
 # ══════════════════════════════════════════════════════════════════════════════
 #  ORDER  (rate-limited)
 # ══════════════════════════════════════════════════════════════════════════════
-def place_order(cid, tok, seg, sid, side, qty, paper, log_fn):
+def _poll_order(cid, tok, order_id, log_fn, tries=8):
+    """Poll GET /v2/orders/{id} until the order reaches a terminal state.
+       Returns (status, traded_price). Market orders normally fill in <2s."""
+    hdrs={"access-token":tok,"client-id":cid}
+    url=f"{ORDER_URL}/{order_id}"
+    last_status="TRANSIT"
+    for i in range(tries):
+        time.sleep(0.4)
+        try:
+            ORDER_GATE.wait()
+            r=requests.get(url,headers=hdrs,timeout=10)
+            if r.status_code!=200: continue
+            d=r.json()
+            if isinstance(d,list): d=d[0] if d else {}
+            status=str(d.get("orderStatus","")).upper()
+            price=float(d.get("averageTradedPrice",0) or d.get("price",0) or 0)
+            last_status=status or last_status
+            if status=="TRADED":
+                return "TRADED", price
+            if status in ("REJECTED","CANCELLED","EXPIRED"):
+                return status, 0.0
+        except Exception:
+            continue
+    return last_status, 0.0   # still TRANSIT/PENDING after polling = not filled
+
+def place_order(cid, tok, seg, sid, side, qty, paper, log_fn, ref="") -> dict:
+    """Place a MARKET order and CONFIRM it actually filled.
+       Returns {"filled":bool, "price":float, "status":str, "order_id":str}.
+       A position must only be considered open when filled is True."""
+    tag=f"{ref} " if ref else ""
     if paper:
-        log_fn(f"[PAPER] {side} qty={qty} {seg}:{sid}")
-        return 0.0
+        log_fn(f"[PAPER] {tag}{side} qty={qty} {seg}:{sid}")
+        return {"filled":True,"price":0.0,"status":"PAPER","order_id":""}
     ORDER_GATE.wait()
     hdrs={"Content-Type":"application/json","access-token":tok,"client-id":cid}
     pl={"dhanClientId":str(cid),"transactionType":side,"exchangeSegment":seg,
@@ -469,31 +523,44 @@ def place_order(cid, tok, seg, sid, side, qty, paper, log_fn):
             r=requests.post(ORDER_URL,headers=hdrs,json=pl,timeout=15)
         except Exception as e:
             last_err=f"network: {e}"; time.sleep(1.0); continue
-        # 429 — back off and retry
         if r.status_code==429:
             last_err="429 rate limit"; time.sleep(1.5*(att+1)); continue
-        # Non-200 — log the body so we can see WHY
         if r.status_code!=200:
             try: body=r.json()
             except: body=r.text[:200]
             last_err=f"HTTP {r.status_code}: {body}"
-            log_fn(f"[ORDER REJECTED] {side} {seg}:{sid} qty={qty} → {last_err}")
-            return 0.0
-        # 200 — but check orderStatus
+            log_fn(f"[ORDER REJECTED] {tag}{side} {seg}:{sid} qty={qty} → {last_err}")
+            return {"filled":False,"price":0.0,"status":"HTTP_ERR","order_id":""}
         try: d=r.json()
         except:
-            log_fn(f"[ORDER ERR] {side} {seg}:{sid}: bad JSON response"); return 0.0
+            log_fn(f"[ORDER ERR] {tag}{side} {seg}:{sid}: bad JSON"); 
+            return {"filled":False,"price":0.0,"status":"BAD_JSON","order_id":""}
         status=str(d.get("orderStatus","")).upper()
-        oid=d.get("orderId","")
+        oid=str(d.get("orderId","") or "")
+        # Immediate rejection
         if status in ("REJECTED","CANCELLED"):
             err=d.get("omsErrorDescription") or d.get("errorMessage") or "rejected by broker"
-            log_fn(f"[ORDER REJECTED] {side} {seg}:{sid} qty={qty} id={oid} → {err}")
-            return 0.0
-        # Accepted (TRANSIT / PENDING / TRADED)
-        log_fn(f"[ORDER OK] {side} {seg}:{sid} qty={qty} id={oid} status={status}")
-        return float(d.get("averageTradedPrice",0) or d.get("price",0) or 0)
-    log_fn(f"[ORDER FAILED] {side} {seg}:{sid} qty={qty} after retries → {last_err}")
-    return 0.0
+            log_fn(f"[ORDER REJECTED] {tag}{side} {seg}:{sid} qty={qty} id={oid} → {err}")
+            return {"filled":False,"price":0.0,"status":status,"order_id":oid}
+        # Accepted by Dhan — but NOT yet filled. Confirm execution.
+        log_fn(f"[ORDER SENT] {tag}{side} {seg}:{sid} qty={qty} id={oid} status={status} — confirming...")
+        price=float(d.get("averageTradedPrice",0) or 0)
+        if status=="TRADED" and price>0:
+            log_fn(f"[ORDER FILLED] {tag}{side} {seg}:{sid} qty={qty} @{price:.2f}")
+            return {"filled":True,"price":price,"status":"TRADED","order_id":oid}
+        if oid:
+            fstatus,fprice=_poll_order(cid,tok,oid,log_fn)
+            if fstatus=="TRADED":
+                log_fn(f"[ORDER FILLED] {tag}{side} {seg}:{sid} qty={qty} @{fprice:.2f}")
+                return {"filled":True,"price":fprice,"status":"TRADED","order_id":oid}
+            # Did not fill — tell the user clearly (this is the ZINCMINI case)
+            log_fn(f"[ORDER NOT FILLED] {tag}{side} {seg}:{sid} qty={qty} id={oid} "
+                   f"stuck at {fstatus} — order did NOT go through "
+                   f"(near-expiry close-only or no liquidity?)")
+            return {"filled":False,"price":0.0,"status":fstatus,"order_id":oid}
+        return {"filled":False,"price":0.0,"status":status,"order_id":oid}
+    log_fn(f"[ORDER FAILED] {tag}{side} {seg}:{sid} qty={qty} after retries → {last_err}")
+    return {"filled":False,"price":0.0,"status":"FAILED","order_id":""}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  WEBSOCKET FEED  (improved connection logic)
@@ -645,23 +712,31 @@ class IndexTrader:
         if not info:
             self.log(f"[{self.idx['name']}] Could not resolve ATM {opt_type}"); return
         qty=self.lots*info["lot"]
-        price=place_order(self.cid,self.tok,self.idx["opt_seg"],info["sid"],
-                          "BUY",qty,self.paper,self.log)
+        res=place_order(self.cid,self.tok,self.idx["opt_seg"],info["sid"],
+                        "BUY",qty,self.paper,self.log,ref=f"[{self.idx['name']}]")
+        if not res["filled"]:
+            self.log(f"[{self.idx['name']}] ENTRY FAILED ({res['status']}) — staying FLAT")
+            with self._lock: self.status=f"ENTRY FAILED:{res['status']}"
+            return
         with self._lock:
             self.position=opt_type; self.opt_sid=info["sid"]; self.opt_sym=info["sym"]
-            self.entry=price or info["ltp"]; self.opt_ltp=info["ltp"]
+            self.entry=res["price"] or info["ltp"]; self.opt_ltp=info["ltp"]
             self.strike=info["strike"]; self.lot_size=info["lot"]
             self.status=f"{opt_type} {info['strike']}"
         self.feed.add_sub(info["sid"], self.idx["opt_seg"])
-        self.log(f"[{self.idx['name']}] BUY {info['sym']} qty={qty} @{self.entry:.2f}")
+        self.log(f"[{self.idx['name']}] OPEN {info['sym']} qty={qty} @{self.entry:.2f}")
 
     def _exit(self):
         if self.position=="FLAT": return
         pnl=self.pnl
         qty=self.lots*self.lot_size
-        place_order(self.cid,self.tok,self.idx["opt_seg"],self.opt_sid,
-                    "SELL",qty,self.paper,self.log)
-        self.log(f"[{self.idx['name']}] EXIT {self.opt_sym} P&L=₹{pnl:+.2f}")
+        res=place_order(self.cid,self.tok,self.idx["opt_seg"],self.opt_sid,
+                        "SELL",qty,self.paper,self.log,ref=f"[{self.idx['name']}]")
+        if not res["filled"]:
+            self.log(f"[{self.idx['name']}] ⚠ EXIT FAILED ({res['status']}) — "
+                     f"position STILL OPEN, will retry next signal")
+            return
+        self.log(f"[{self.idx['name']}] EXIT {self.opt_sym} @{res['price']:.2f}  P&L=₹{pnl:+.2f}")
         with self._lock:
             self.position="FLAT"; self.entry=0.0; self.opt_sid=""
             self.opt_sym=""; self.status="FLAT"
@@ -721,18 +796,28 @@ class FutureTrader:
     def _go(self, direction):
         side="BUY" if direction=="LONG" else "SELL"
         qty=self.lots*self.lot_size
-        price=place_order(self.cid,self.tok,self.seg,self.sid,side,qty,self.paper,self.log)
+        res=place_order(self.cid,self.tok,self.seg,self.sid,side,qty,self.paper,self.log,
+                        ref=f"[{self.name}]")
+        if not res["filled"]:
+            self.log(f"[{self.name}] ENTRY FAILED ({res['status']}) — staying FLAT")
+            with self._lock: self.status=f"ENTRY FAILED:{res['status']}"
+            return
         with self._lock:
-            self.position=direction; self.entry=price or self.ltp
+            self.position=direction; self.entry=res["price"] or self.ltp
             self.status=f"{'↑LONG' if direction=='LONG' else '↓SHORT'}"
-        self.log(f"[{self.name}] {side} {qty} @{self.entry:.2f}  ({direction})")
+        self.log(f"[{self.name}] OPEN {side} {qty} @{self.entry:.2f}  ({direction})")
 
     def _close(self):
         if self.position=="FLAT": return
         side="SELL" if self.position=="LONG" else "BUY"
         qty=self.lots*self.lot_size; pnl=self.pnl
-        place_order(self.cid,self.tok,self.seg,self.sid,side,qty,self.paper,self.log)
-        self.log(f"[{self.name}] CLOSE {side} {qty}  P&L=₹{pnl:+.2f}")
+        res=place_order(self.cid,self.tok,self.seg,self.sid,side,qty,self.paper,self.log,
+                        ref=f"[{self.name}]")
+        if not res["filled"]:
+            self.log(f"[{self.name}] ⚠ CLOSE FAILED ({res['status']}) — "
+                     f"position STILL OPEN, will retry next signal")
+            return
+        self.log(f"[{self.name}] CLOSE {side} {qty} @{res['price']:.2f}  P&L=₹{pnl:+.2f}")
         with self._lock:
             self.position="FLAT"; self.entry=0.0; self.status="FLAT"
 

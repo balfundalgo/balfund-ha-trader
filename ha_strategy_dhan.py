@@ -51,6 +51,14 @@ MCX_FUTURES = {
     "GOLDPETAL":   {"name":"GOLDPETAL",  "seg":"MCX_COMM","match":["GOLDPETAL"], "klass":"bullion",    "roll_days":6},
 }
 
+# NSE equity definitions (security id resolved from master CSV at runtime).
+# Traded INTRADAY (MIS): GREEN→LONG (BUY), RED→SHORT (SELL) — same reversal as MCX.
+# 'sym' = exact NSE trading symbol (suffix -EQ/-BE stripped during match).
+EQUITIES = {
+    "BSE":    {"name":"BSE",    "seg":"NSE_EQ", "sym":"BSE"},
+    "WAAREE": {"name":"WAAREE", "seg":"NSE_EQ", "sym":"WAAREEENER"},
+}
+
 # WS packet
 REQ_SUB         = 15
 RESP_TICK       = 2
@@ -374,6 +382,32 @@ def resolve_mcx_future(rows, fut, log_fn=print) -> Optional[dict]:
     log_fn(f"  {tag} {name} sid={sid}  {ts}  expiry={e} ({days_left}d left)  "
            f"lot={lot_i}  [{klass}, roll@{roll_days}d]")
     return {"sid":sid,"ts":ts,"expiry":str(e),"lot":lot_i,"name":name,"days_left":days_left}
+
+def resolve_equity(rows, eq, log_fn=print) -> Optional[dict]:
+    """Resolve an NSE equity's security id from the master CSV.
+       Matches SEM_TRADING_SYMBOL with the -EQ/-BE/-BZ/-IL/-SM suffix stripped."""
+    name=eq["name"]; want=eq["sym"].strip().upper()
+    for row in rows:
+        if row.get("SEM_EXM_EXCH_ID","").strip().upper()!="NSE": continue
+        seg=row.get("SEM_SEGMENT","").strip().upper()
+        # Equity cash segment only (skip F&O/index rows)
+        if seg not in ("E","EQ","EQUITY",""): 
+            pass
+        ts=row.get("SEM_TRADING_SYMBOL","").strip().upper()
+        if not ts: continue
+        base=re.sub(r"-(EQ|BE|BZ|IL|SM|GB)$","",ts)
+        if base!=want: continue
+        # Only cash equity instruments (not futures/options on the same symbol)
+        instr=row.get("SEM_INSTRUMENT_NAME","").strip().upper()
+        if instr and instr not in ("EQUITY","ES","EQ"): 
+            # skip if it's clearly a derivative row
+            if instr in ("OPTSTK","FUTSTK","OPTIDX","FUTIDX"): continue
+        sid=row.get("SEM_SMST_SECURITY_ID","").strip()
+        if not sid: continue
+        log_fn(f"  ✓ {name} ({want}) sid={sid}  [NSE_EQ, INTRADAY]")
+        return {"sid":sid,"name":name,"sym":want}
+    log_fn(f"  ✗ {name} ({want}): not found in NSE equity master")
+    return None
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  OPTION CHAIN  (cached + rate-limited)
@@ -780,6 +814,9 @@ class FutureTrader:
         self.position="FLAT"          # FLAT / LONG / SHORT
         self.entry=0.0; self.bar_time="-"; self.status="Waiting"; self.strike=0
         self.expiry="-"
+        # Seed instrument type + display kind depend on segment
+        self.kind = "EQ" if self.seg=="NSE_EQ" else "FUT"
+        self.seed_instrument = "EQUITY" if self.seg=="NSE_EQ" else "FUTCOM"
         self._startup_done=False; self._lock=threading.Lock()
 
     @property
@@ -852,8 +889,9 @@ class FutureTrader:
 class Engine:
     def __init__(self, cid, tok, iv_sec, period, mult, paper,
                  nifty_lots, sensex_lots, sq_time, trade_nifty, trade_sensex,
-                 mcx_selections, log_fn):
+                 mcx_selections, equity_selections, log_fn):
         # mcx_selections: dict name → lots, e.g. {"SILVERMICRO":1, "ZINCMINI":2}
+        # equity_selections: dict name → shares, e.g. {"BSE":10, "WAAREE":25}
         self.cid=cid; self.tok=tok; self.iv_sec=iv_sec
         self.period=period; self.mult=mult; self.paper=paper
         self.sq_time=sq_time; self.log=log_fn
@@ -880,9 +918,10 @@ class Engine:
             self._spot_map[t.idx["sid"]]=t
             self.feed.add_sub(t.idx["sid"], t.idx["seg"])
 
-        # Future traders (resolved later in _run after master CSV loads)
+        # Future + equity traders (resolved later in _run after master CSV loads)
         self._mcx_selections={k:v for k,v in (mcx_selections or {}).items() if v and v>0}
-        self.futures: List[FutureTrader]=[]
+        self._equity_selections={k:v for k,v in (equity_selections or {}).items() if v and v>0}
+        self.futures: List[FutureTrader]=[]   # holds both MCX futures AND equities
         self._fut_map: Dict[str,FutureTrader]={}
 
     def start(self): threading.Thread(target=self._run,daemon=True).start()
@@ -929,7 +968,7 @@ class Engine:
             rest_iv="15"
         # Load master CSV once if we trade options (for lot sizes) or any MCX future
         rows=None
-        need_master = bool(self.traders) or bool(self._mcx_selections)
+        need_master = bool(self.traders) or bool(self._mcx_selections) or bool(self._equity_selections)
         if need_master:
             try:
                 rows=load_master(self.log)
@@ -963,6 +1002,25 @@ class Engine:
                 except Exception as e:
                     self.log(f"[{name} resolve ERR] {e}")
 
+        # Resolve each selected NSE equity (INTRADAY long/short reversal)
+        if self._equity_selections and rows:
+            for name, shares in self._equity_selections.items():
+                eq=EQUITIES.get(name)
+                if not eq: continue
+                try:
+                    info=resolve_equity(rows, eq, self.log)
+                    if info:
+                        # Equity: lot_size=1, "lots" = share quantity
+                        et=FutureTrader(eq,info["sid"],1,shares,
+                            self.period,self.mult,self.paper,self.feed,
+                            self.cid,self.tok,self.log)
+                        self.futures.append(et)
+                        self._fut_map[info["sid"]]=et
+                        self._aggs[info["sid"]]=CandleAgg(self.iv_sec)
+                        self.feed.add_sub(info["sid"], eq["seg"])
+                except Exception as e:
+                    self.log(f"[{name} resolve ERR] {e}")
+
         if rest_iv is None:
             self.log(f"[Engine] 5s timeframe — no historical seed (REST min is 1m). "
                      f"Building candles live; Supertrend stabilises after a few minutes.")
@@ -989,7 +1047,7 @@ class Engine:
                     self.log(f"[seed] {f.name} live-only (5s)")
                     continue
                 c=fetch_ohlc(self.cid,self.tok,f.sid,f.seg,rest_iv,
-                             days=10,instrument="FUTCOM")
+                             days=10,instrument=f.seed_instrument)
                 self._aggs[f.sid]=CandleAgg(self.iv_sec,c)
                 if c: f.ltp=float(c[-1]["close"])
                 self.log(f"[seed] {f.name} {len(c)} bars ({rest_iv}m)  ltp={f.ltp:.2f}")
@@ -1080,6 +1138,13 @@ class App(ctk.CTk):
             tv=ctk.BooleanVar(value=_mcx_saved.get(_name,{}).get("trade",False))
             lv=ctk.IntVar(value=_mcx_saved.get(_name,{}).get("lots",1))
             self.mcx_vars[_name]=(tv,lv)
+        # Equity toggles + share qty
+        self.eq_vars={}   # name → (BooleanVar trade, IntVar shares)
+        _eq_saved=_s.get("equity",{})
+        for _name in EQUITIES:
+            tv=ctk.BooleanVar(value=_eq_saved.get(_name,{}).get("trade",False))
+            qv=ctk.IntVar(value=_eq_saved.get(_name,{}).get("shares",1))
+            self.eq_vars[_name]=(tv,qv)
         self.sq_var=ctk.StringVar(value=_s.get("sq","15:15"))
 
         self._build()
@@ -1116,6 +1181,7 @@ class App(ctk.CTk):
                 "nifty_lots":self.nifty_lots_var.get(),"sensex_lots":self.sensex_lots_var.get(),
                 "trade_nifty":self.trade_nifty_var.get(),"trade_sensex":self.trade_sensex_var.get(),
                 "mcx":{n:{"trade":tv.get(),"lots":lv.get()} for n,(tv,lv) in self.mcx_vars.items()},
+                "equity":{n:{"trade":tv.get(),"shares":qv.get()} for n,(tv,qv) in self.eq_vars.items()},
                 "sq":self.sq_var.get()},indent=2))
         except: pass
     def _on_close(self): self._save(); self._save_creds(); self.destroy()
@@ -1254,6 +1320,14 @@ class App(ctk.CTk):
                 button_color=AC,progress_color=ACL).pack(side="left")
             ctk.CTkEntry(row,textvariable=lv,width=50,justify="center",font=FONT).pack(side="left",padx=4)
             ctk.CTkLabel(row,text="lots",font=("Segoe UI",10,"bold"),text_color=GY).pack(side="left")
+        ctk.CTkFrame(ix,fg_color=BD,height=1).pack(fill="x",padx=12,pady=6)
+        ctk.CTkLabel(ix,text="NSE Equity (long/short, MIS)",font=FONT,text_color=AC).pack(anchor="w",padx=12,pady=(2,2))
+        for _name,(tv,qv) in self.eq_vars.items():
+            row=ctk.CTkFrame(ix,fg_color="transparent"); row.pack(fill="x",padx=12,pady=1)
+            ctk.CTkSwitch(row,text=_name,variable=tv,font=FONT,width=150,
+                button_color=AC,progress_color=ACL).pack(side="left")
+            ctk.CTkEntry(row,textvariable=qv,width=50,justify="center",font=FONT).pack(side="left",padx=4)
+            ctk.CTkLabel(row,text="qty",font=("Segoe UI",10,"bold"),text_color=GY).pack(side="left")
         # Control
         cf=card(2,"Control")
         ctk.CTkSwitch(cf,text="Paper Mode (safe)",variable=self.paper_var,font=FONT,
@@ -1323,15 +1397,16 @@ class App(ctk.CTk):
             self._nb.set("Connection"); return
         cid=self._token_client; tok=self._access_token
         mcx_sel={n:lv.get() for n,(tv,lv) in self.mcx_vars.items() if tv.get()}
+        eq_sel={n:qv.get() for n,(tv,qv) in self.eq_vars.items() if tv.get()}
         any_index=self.trade_nifty_var.get() or self.trade_sensex_var.get()
-        if not (any_index or mcx_sel):
+        if not (any_index or mcx_sel or eq_sel):
             self._set_status("Enable at least one instrument",RD); return
         tf=self.tf_var.get(); iv=5 if tf=="5s" else int(tf)*60
         self.engine=Engine(cid,tok,iv,max(1,self.period_var.get()),
             max(0.1,self.mult_var.get()),self.paper_var.get(),
             self.nifty_lots_var.get(),self.sensex_lots_var.get(),
             self.sq_var.get(),self.trade_nifty_var.get(),self.trade_sensex_var.get(),
-            mcx_sel,
+            mcx_sel, eq_sel,
             log_fn=self._log)
         # Build tree rows
         for iid in self._tree.get_children(): self._tree.delete(iid)
@@ -1341,6 +1416,9 @@ class App(ctk.CTk):
             self._tree_ids[t.idx["name"]]=iid
         for name in mcx_sel:
             iid=self._tree.insert("","end",values=(name,"-","-","-","-","FLAT","FUT","-","-","-","-","Resolving..."))
+            self._tree_ids[name]=iid
+        for name in eq_sel:
+            iid=self._tree.insert("","end",values=(name,"-","-","-","-","FLAT","EQ","-","-","-","-","Resolving..."))
             self._tree_ids[name]=iid
         self.engine.start(); self._running=True
         self._btn_start.configure(state="disabled",text="RUNNING ●")
@@ -1396,7 +1474,7 @@ class App(ctk.CTk):
                     f.st_dir,
                     f"{f.atr:.2f}" if f.atr else "-",
                     f.position,
-                    "FUT",
+                    f.kind,
                     f"{f.entry:.2f}" if f.entry else "-",
                     f"{f.ltp:.2f}" if f.ltp else "-",
                     f"₹{pnl:+.2f}" if f.position!="FLAT" else "-",
